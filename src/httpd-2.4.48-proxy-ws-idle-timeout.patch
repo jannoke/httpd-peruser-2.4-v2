@@ -1,0 +1,109 @@
+diff --git a/docs/manual/mod/mod_proxy_wstunnel.html.en b/docs/manual/mod/mod_proxy_wstunnel.html.en
+index 9f2c120..61ff7de 100644
+--- a/docs/manual/mod/mod_proxy_wstunnel.html.en
++++ b/docs/manual/mod/mod_proxy_wstunnel.html.en
+@@ -83,6 +83,7 @@ in the response <code>Upgrade</code></p>
+ <div id="quickview"><a href="https://www.apache.org/foundation/contributing.html" class="badge"><img src="https://www.apache.org/images/SupportApache-small.png" alt="Support Apache!" /></a><h3 class="directives">Directives</h3>
+ <ul id="toc">
+ <li><img alt="" src="../images/down.gif" /> <a href="#proxywebsocketfallbacktoproxyhttp">ProxyWebsocketFallbackToProxyHttp</a></li>
++<li><img alt="" src="../images/down.gif" /> <a href="#proxywebsocketidletimeout">ProxyWebsocketIdleTimeout</a></li>
+ </ul>
+ <h3>Bugfix checklist</h3><ul class="seealso"><li><a href="https://www.apache.org/dist/httpd/CHANGES_2.4">httpd changelog</a></li><li><a href="https://bz.apache.org/bugzilla/buglist.cgi?bug_status=__open__&amp;list_id=144532&amp;product=Apache%20httpd-2&amp;query_format=specific&amp;order=changeddate%20DESC%2Cpriority%2Cbug_severity&amp;component=mod_proxy_wstunnel">Known issues</a></li><li><a href="https://bz.apache.org/bugzilla/enter_bug.cgi?product=Apache%20httpd-2&amp;component=mod_proxy_wstunnel">Report a bug</a></li></ul><h3>See also</h3>
+ <ul class="seealso">
+@@ -108,6 +109,23 @@ in the response <code>Upgrade</code></p>
+     WebSocket requests as in httpd 2.4.46 and earlier.</p>
+ 
+ </div>
++
++<div class="directive-section"><h2><a name="ProxyWebsocketIdleTimeout" id="ProxyWebsocketIdleTimeout">ProxyWebsocketIdleTimeout</a> <a name="proxywebsocketidletimeout" id="proxywebsocketidletimeout">Directive</a> <a title="Permanent link" href="#proxywebsocketidletimeout" class="permalink">&para;</a></h2>
++<table class="directive">
++<tr><th><a href="directive-dict.html#Description">Description:</a></th><td>Sets the maximum amount of time to wait for data on the websockets tunnel</td></tr>
++<tr><th><a href="directive-dict.html#Syntax">Syntax:</a></th><td><code>ProxyWebsocketIdleTimeout <var>num</var>[ms]</code></td></tr>
++<tr><th><a href="directive-dict.html#Default">Default:</a></th><td><code>ProxyWebsocketIdleTimeout 0</code></td></tr>
++<tr><th><a href="directive-dict.html#Context">Context:</a></th><td>server config, virtual host</td></tr>
++<tr><th><a href="directive-dict.html#Status">Status:</a></th><td>Extension</td></tr>
++<tr><th><a href="directive-dict.html#Module">Module:</a></th><td>mod_proxy_wstunnel</td></tr>
++</table>
++    <p>This directive imposes a maximum amount of time for the tunnel to be
++    left open while idle. The timeout is considered in seconds by default, but
++    it is possible to increase the time resolution to milliseconds
++    adding the <em>ms</em> suffix.</p>
++
++</div>
++
+ </div>
+ <div class="bottomlang">
+ <p><span>Available Languages: </span><a href="../en/mod/mod_proxy_wstunnel.html" title="English">&nbsp;en&nbsp;</a> |
+diff --git a/modules/proxy/mod_proxy_wstunnel.c b/modules/proxy/mod_proxy_wstunnel.c
+index bcbba42..c29ded1 100644
+--- a/modules/proxy/mod_proxy_wstunnel.c
++++ b/modules/proxy/mod_proxy_wstunnel.c
+@@ -22,6 +22,7 @@ module AP_MODULE_DECLARE_DATA proxy_wstunnel_module;
+ typedef struct {
+     unsigned int fallback_to_proxy_http     :1,
+                  fallback_to_proxy_http_set :1;
++    apr_time_t idle_timeout;
+ } proxyws_dir_conf;
+ 
+ static int can_fallback_to_proxy_http;
+@@ -152,6 +153,8 @@ static int proxy_wstunnel_request(apr_pool_t *p, request_rec *r,
+     conn_rec *c = r->connection;
+     apr_socket_t *sock = conn->sock;
+     conn_rec *backconn = conn->connection;
++    proxyws_dir_conf *dconf = ap_get_module_config(r->per_dir_config,
++                                                   &proxy_wstunnel_module);
+     char *buf;
+     apr_bucket_brigade *header_brigade;
+     apr_bucket *e;
+@@ -229,10 +232,13 @@ static int proxy_wstunnel_request(apr_pool_t *p, request_rec *r,
+     c->keepalive = AP_CONN_CLOSE;
+ 
+     do { /* Loop until done (one side closes the connection, or an error) */
+-        rv = apr_pollset_poll(pollset, -1, &pollcnt, &signalled);
++        rv = apr_pollset_poll(pollset, dconf->idle_timeout, &pollcnt, &signalled);
+         if (rv != APR_SUCCESS) {
+             if (APR_STATUS_IS_EINTR(rv)) {
+                 continue;
++            } else if(APR_STATUS_IS_TIMEUP(rv)){
++               ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, "RH: the connection has timed out");
++               return HTTP_REQUEST_TIME_OUT;
+             }
+             ap_log_rerror(APLOG_MARK, APLOG_ERR, rv, r, APLOGNO(02444) "error apr_poll()");
+             return HTTP_INTERNAL_SERVER_ERROR;
+@@ -418,11 +424,26 @@ cleanup:
+     return status;
+ }
+ 
++static const char * proxyws_set_idle(cmd_parms *cmd, void *conf, const char *val)
++{
++    proxyws_dir_conf *dconf = conf;
++    if (ap_timeout_parameter_parse(val, &(dconf->idle_timeout), "s") != APR_SUCCESS)
++        return "ProxyWebsocketIdleTimeout timeout has wrong format";
++
++    if (dconf->idle_timeout < 0)
++        return "ProxyWebsocketIdleTimeout timeout has to be a non-negative number";
++
++    if (!dconf->idle_timeout) dconf->idle_timeout = -1; /* loop indefinitely */
++
++    return NULL;
++}
++
+ static void *create_proxyws_dir_config(apr_pool_t *p, char *dummy)
+ {
+     proxyws_dir_conf *new =
+         (proxyws_dir_conf *) apr_pcalloc(p, sizeof(proxyws_dir_conf));
+ 
++    new->idle_timeout = -1; /* no timeout */
+     new->fallback_to_proxy_http = 1;
+ 
+     return (void *) new;
+@@ -465,7 +486,8 @@ static const command_rec ws_proxy_cmds[] =
+                  proxyws_fallback_to_proxy_http, NULL, RSRC_CONF|ACCESS_CONF,
+                  "whether to let mod_proxy_http handle the upgrade and tunneling, "
+                  "On by default"),
+-
++    AP_INIT_TAKE1("ProxyWebsocketIdleTimeout", proxyws_set_idle, NULL, RSRC_CONF|ACCESS_CONF,
++                 "timeout for activity in either direction, unlimited by default."),
+     {NULL}
+ };
+ 

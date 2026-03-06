@@ -1,0 +1,124 @@
+diff --git a/docs/manual/mod/mpm_common.html.en b/docs/manual/mod/mpm_common.html.en
+index d7a2fea..c911a4e 100644
+--- a/docs/manual/mod/mpm_common.html.en
++++ b/docs/manual/mod/mpm_common.html.en
+@@ -42,6 +42,7 @@ more than one multi-processing module (MPM)</td></tr>
+ <li><img alt="" src="../images/down.gif" /> <a href="#enableexceptionhook">EnableExceptionHook</a></li>
+ <li><img alt="" src="../images/down.gif" /> <a href="#gracefulshutdowntimeout">GracefulShutdownTimeout</a></li>
+ <li><img alt="" src="../images/down.gif" /> <a href="#listen">Listen</a></li>
++<li><img alt="" src="../images/down.gif" /> <a href="#listenfree">ListenFree</a></li>
+ <li><img alt="" src="../images/down.gif" /> <a href="#listenbacklog">ListenBackLog</a></li>
+ <li><img alt="" src="../images/down.gif" /> <a href="#listencoresbucketsratio">ListenCoresBucketsRatio</a></li>
+ <li><img alt="" src="../images/down.gif" /> <a href="#maxconnectionsperchild">MaxConnectionsPerChild</a></li>
+@@ -244,6 +245,31 @@ discussion of the <code>Address already in use</code> error message,
+ including other causes.</a></li>
+ </ul>
+ </div>
++
++<div class="top"><a href="#page-header"><img alt="top" src="../images/up.gif" /></a></div>
++<div class="directive-section"><h2><a name="ListenFree" id="ListenFree">ListenFree</a> <a name="listenfree" id="listenfree">Directive</a></h2>
++<table class="directive">
++<tr><th><a href="directive-dict.html#Description">Description:</a></th><td>IP addresses and ports that the server
++listens to. Doesn't require IP address to be up</td></tr>
++<tr><th><a href="directive-dict.html#Syntax">Syntax:</a></th><td><code>ListenFree [<var>IP-address</var>:]<var>portnumber</var> [<var>protocol</var>]</code></td></tr>
++<tr><th><a href="directive-dict.html#Context">Context:</a></th><td>server config</td></tr>
++<tr><th><a href="directive-dict.html#Status">Status:</a></th><td>MPM</td></tr>
++<tr><th><a href="directive-dict.html#Module">Module:</a></th><td><code class="module"><a href="../mod/event.html">event</a></code>, <code class="module"><a href="../mod/worker.html">worker</a></code>, <code class="module"><a href="../mod/prefork.html">prefork</a></code>, <code class="module"><a href="../mod/mpm_winnt.html">mpm_winnt</a></code>, <code class="module"><a href="../mod/mpm_netware.html">mpm_netware</a></code>, <code class="module"><a href="../mod/mpmt_os2.html">mpmt_os2</a></code></td></tr>
++<tr><th><a href="directive-dict.html#Compatibility">Compatibility:</a></th><td>This directive is currently available only in Red Hat Enterprise Linux</td></tr>
++</table>
++    <p>The <code class="directive">ListenFree</code> directive is
++    identical to the <code class="directive">Listen</code> directive. 
++    The only difference is in the usage of the IP_FREEBIND socket 
++    option, which is enabled by default with <code class="directive">ListenFree</code>. 
++    If IP_FREEBIND is enabled, it allows httpd to bind to an IP
++    address that is nonlocal or does not (yet) exist. This allows httpd to 
++    listen on a socket without requiring the underlying network interface
++    or the specified dynamic IP address to be up at the time when httpd
++    is trying to bind to it.
++    </p>
++</div>
++
++
+ <div class="top"><a href="#page-header"><img alt="top" src="../images/up.gif" /></a></div>
+ <div class="directive-section"><h2><a name="ListenBackLog" id="ListenBackLog">ListenBackLog</a> <a name="listenbacklog" id="listenbacklog">Directive</a></h2>
+ <table class="directive">
+diff --git a/include/ap_listen.h b/include/ap_listen.h
+index d5ed968..be1a60c 100644
+--- a/include/ap_listen.h
++++ b/include/ap_listen.h
+@@ -138,6 +138,9 @@ AP_DECLARE_NONSTD(const char *) ap_set_listenbacklog(cmd_parms *cmd, void *dummy
+ AP_DECLARE_NONSTD(const char *) ap_set_listencbratio(cmd_parms *cmd, void *dummy, const char *arg);
+ AP_DECLARE_NONSTD(const char *) ap_set_listener(cmd_parms *cmd, void *dummy,
+                                                 int argc, char *const argv[]);
++AP_DECLARE_NONSTD(const char *) ap_set_freelistener(cmd_parms *cmd, void *dummy,
++                                                    int argc, char *const argv[]);
++
+ AP_DECLARE_NONSTD(const char *) ap_set_send_buffer_size(cmd_parms *cmd, void *dummy,
+                                                         const char *arg);
+ AP_DECLARE_NONSTD(const char *) ap_set_receive_buffer_size(cmd_parms *cmd,
+@@ -160,6 +163,8 @@ AP_INIT_TAKE1("ListenCoresBucketsRatio", ap_set_listencbratio, NULL, RSRC_CONF,
+   "Ratio between the number of CPU cores (online) and the number of listeners buckets"), \
+ AP_INIT_TAKE_ARGV("Listen", ap_set_listener, NULL, RSRC_CONF, \
+   "A port number or a numeric IP address and a port number, and an optional protocol"), \
++AP_INIT_TAKE_ARGV("ListenFree", ap_set_freelistener, NULL, RSRC_CONF, \
++  "A port number or a numeric IP address and a port number, and an optional protocol"), \
+ AP_INIT_TAKE1("SendBufferSize", ap_set_send_buffer_size, NULL, RSRC_CONF, \
+   "Send buffer size in bytes"), \
+ AP_INIT_TAKE1("ReceiveBufferSize", ap_set_receive_buffer_size, NULL, \
+diff --git a/server/listen.c b/server/listen.c
+index 2a4e87a..280bbe7 100644
+--- a/server/listen.c
++++ b/server/listen.c
+@@ -60,6 +60,7 @@ static int ap_listenbacklog;
+ static int ap_listencbratio;
+ static int send_buffer_size;
+ static int receive_buffer_size;
++static int ap_listenfreebind;
+ #ifdef HAVE_SYSTEMD
+ static int use_systemd = -1;
+ #endif
+@@ -159,6 +160,21 @@ static apr_status_t make_sock(apr_pool_t *p, ap_listen_rec *server, int do_bind_
+     }
+ #endif
+ 
++
++#if defined(APR_SO_FREEBIND)
++    if (ap_listenfreebind) {
++        if (apr_socket_opt_set(s, APR_SO_FREEBIND, one) < 0) {
++            stat = apr_get_netos_error();
++            ap_log_perror(APLOG_MARK, APLOG_CRIT, stat, p, APLOGNO(02182)
++                          "make_sock: apr_socket_opt_set: "
++                          "error setting APR_SO_FREEBIND");
++            apr_socket_close(s);
++            return stat;
++       }
++   }
++#endif
++
++
+     if (do_bind_listen) {
+ #if APR_HAVE_IPV6
+         if (server->bind_addr->family == APR_INET6) {
+@@ -971,6 +987,7 @@ AP_DECLARE(void) ap_listen_pre_config(void)
+     }
+ }
+ 
++
+ AP_DECLARE_NONSTD(const char *) ap_set_listener(cmd_parms *cmd, void *dummy,
+                                                 int argc, char *const argv[])
+ {
+@@ -1044,6 +1061,14 @@ AP_DECLARE_NONSTD(const char *) ap_set_listener(cmd_parms *cmd, void *dummy,
+                           scope_id, NULL, cmd->temp_pool);
+ }
+ 
++AP_DECLARE_NONSTD(const char *) ap_set_freelistener(cmd_parms *cmd, void *dummy,
++                                                    int argc,
++                                                    char *const argv[])
++{
++    ap_listenfreebind = 1;
++    return ap_set_listener(cmd, dummy, argc, argv);
++}
++
+ AP_DECLARE_NONSTD(const char *) ap_set_listenbacklog(cmd_parms *cmd,
+                                                      void *dummy,
+                                                      const char *arg)
