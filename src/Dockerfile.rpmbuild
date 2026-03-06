@@ -1,0 +1,48 @@
+# Dockerfile for building httpd peruser RPM
+# Uses AlmaLinux 9 (RHEL 9 compatible)
+# Build context should be the src/ directory containing all source files
+FROM almalinux:9
+
+# Install build dependencies
+RUN dnf install -y \
+    rpm-build \
+    rpmdevtools \
+    dnf-plugins-core \
+    gcc \
+    autoconf \
+    pkgconfig \
+    findutils \
+    xmlto \
+    perl-interpreter \
+    perl-generators \
+    systemd-devel \
+    zlib-devel \
+    libselinux-devel \
+    lua-devel \
+    brotli-devel \
+    apr-devel \
+    apr-util-devel \
+    pcre-devel \
+    gnupg2 \
+    systemd-rpm-macros \
+    openssl-devel \
+    libtool \
+    which \
+    make \
+    && dnf clean all
+
+# Set up rpmbuild directory structure
+RUN rpmdev-setuptree
+
+# Copy all source files into the SOURCES directory
+COPY . /root/rpmbuild/SOURCES/
+
+# Move spec file to SPECS directory
+RUN mv /root/rpmbuild/SOURCES/httpd.spec /root/rpmbuild/SPECS/httpd.spec
+
+# Set up GPG keyring for signature verification
+RUN gpg --import /root/rpmbuild/SOURCES/KEYS 2>/dev/null || true
+
+# Build the RPM
+WORKDIR /root/rpmbuild
+CMD ["rpmbuild", "-ba", "SPECS/httpd.spec"]
