@@ -129,24 +129,25 @@ jobs:
           name: rpms
           path: /tmp/rpms
 
-      - name: Install httpd and dependencies
+      - name: Install base test dependencies
         run: |
-          dnf install -y --setopt=install_weak_deps=False --allowerasing httpd-filesystem curl
+          dnf install -y --setopt=install_weak_deps=False --allowerasing curl gdb
           dnf clean all
 
-      - name: Install built peruser RPM
+      - name: Install built peruser RPMs
         run: |
           echo "=== Available RPMs ==="
-          find /tmp/rpms -name "*.rpm" | grep -v debuginfo | grep -v src
-          RPMS=$(find /tmp/rpms -name "httpd-*.rpm" | grep -v debuginfo | grep -v src)
-          echo "Installing: $RPMS"
-          dnf install -y $RPMS
+          find /tmp/rpms -name "*.rpm" | grep -vE 'debuginfo|debugsource|\.src\.rpm' || true
 
-      - name: Install debug tools
-        run: |
-          dnf install -y gdb
-          # Install debuginfo if available (best effort)
-          dnf debuginfo-install -y httpd 2>/dev/null || true
+          RPMS=$(find /tmp/rpms -name "*.rpm" \
+            | grep -E '/(httpd|mod_).+\.rpm$' \
+            | grep -vE 'debuginfo|debugsource|\.src\.rpm' \
+            | sort)
+
+          echo "Installing:"
+          printf '%s\n' $RPMS
+
+          dnf install -y --allowerasing --setopt=install_weak_deps=False $RPMS
           dnf clean all
 
       - name: Enable core dumps
@@ -162,14 +163,11 @@ jobs:
           echo ""
           echo "[1/6] Creating test user and files..."
 
-          # Create dedicated test user separate from apache
           useradd -r -m -d /home/testuser -s /sbin/nologin testuser
           echo "✓ Test user created: testuser (uid=$(id -u testuser))"
 
-          # Ensure document root exists
           mkdir -p /var/www/html
 
-          # Create test HTML file with unique verifiable content
           cat > /var/www/html/index.html << 'HTMLEOF'
           <!DOCTYPE html>
           <html>
@@ -192,7 +190,6 @@ jobs:
         run: |
           echo "[2/6] Configuring httpd with peruser MPM..."
 
-          # Ensure only the peruser MPM is loaded (disable all others)
           cat > /etc/httpd/conf.modules.d/00-mpm.conf << 'EOF'
           # Only peruser MPM is loaded - all other MPMs are disabled
           LoadModule mpm_peruser_module modules/mod_mpm_peruser.so
@@ -201,16 +198,11 @@ jobs:
           #LoadModule mpm_event_module modules/mod_mpm_event.so
           EOF
 
-          # Write peruser-specific configuration
-          # Notes on cgroup:
-          #   - The original Cgroup directive used cgroup v1 paths (/dev/cgroup/...)
-          #   - Rocky Linux 9 uses cgroup v2 exclusively; cgroup v1 is not available
-          #   - Cgroup is therefore omitted here; peruser handles a missing cgroup
-          #     gracefully (logs a warning and continues without it)
           cat > /etc/httpd/conf.d/peruser.conf << 'EOF'
-          # Peruser MPM main configuration
+          ServerName localhost
+
           <IfModule mpm_peruser_module>
-              ServerLimit          2
+              ServerLimit          10
               MinSpareProcessors   1
               MaxSpareProcessors   1
               MaxClients           10
@@ -218,29 +210,27 @@ jobs:
               IdleTimeout          300
           </IfModule>
 
-          # Processor definition: runs as the dedicated testuser
-          # Cgroup directives are intentionally omitted:
-          #   Rocky Linux 9 uses cgroup v2 which is incompatible with the
-          #   cgroup v1 paths used by the peruser Cgroup directive.
-          #   Peruser will log a warning if a Cgroup path is set but
-          #   inaccessible, and continues without cgroup isolation.
           Processor testuser testuser
 
-          # Virtual host on port 8080 with testuser worker processes
           <Processor testuser>
-            User testuser
-            Group testuser
+              User testuser
+              Group testuser
           </Processor>
+
+          Listen 8080
 
           <VirtualHost *:8080>
               ServerName localhost
               DocumentRoot /var/www/html
-              <IfModule peruser.c>
-                ServerEnvironment testuser
-              </IfModule>  
-          </VirtualHost>
 
-          Listen 8080
+              <Directory /var/www/html>
+                  Require all granted
+              </Directory>
+
+              <IfModule peruser.c>
+                  ServerEnvironment testuser
+              </IfModule>
+          </VirtualHost>
           EOF
 
           echo "✓ Configuration written"
@@ -264,32 +254,50 @@ jobs:
       - name: "[3/6] Start httpd"
         id: httpd_start
         run: |
-          echo "[3/6] Starting httpd..."
+          echo "[3/6] Validating and starting httpd..."
 
-          # Enable core dumps for this shell session
           ulimit -c unlimited
 
-          # Start httpd in background mode
-          httpd -k start 2>&1 | tee /tmp/httpd-start.log
+          rm -f /run/httpd/httpd.pid /tmp/httpd-start.log /tmp/httpd-test.log
+          mkdir -p /run/httpd
+
+          echo "--- httpd -t ---"
+          httpd -t
+
+          echo "--- httpd -M ---"
+          httpd -M
+
+          timeout 15s httpd -k start > /tmp/httpd-start.log 2>&1
           HTTPD_EXIT=$?
+
+          if [ "$HTTPD_EXIT" -eq 124 ]; then
+            echo "ERROR: httpd start timed out"
+            echo "httpd_crashed=true" >> "$GITHUB_OUTPUT"
+            cat /tmp/httpd-start.log 2>/dev/null || true
+            cat /var/log/httpd/error_log 2>/dev/null || true
+            pgrep -a httpd 2>/dev/null || true
+            exit 1
+          fi
 
           if [ "$HTTPD_EXIT" -ne 0 ]; then
             echo "ERROR: httpd failed to start (exit code: $HTTPD_EXIT)"
-            cat /tmp/httpd-start.log
+            echo "httpd_crashed=true" >> "$GITHUB_OUTPUT"
+            cat /tmp/httpd-start.log 2>/dev/null || true
             cat /var/log/httpd/error_log 2>/dev/null || true
             exit "$HTTPD_EXIT"
           fi
 
-          # Wait for httpd to fully start
           sleep 3
 
-          # Verify it is actually running
           if ! pgrep -x httpd > /dev/null; then
             echo "ERROR: httpd process not found after start"
+            echo "httpd_crashed=true" >> "$GITHUB_OUTPUT"
+            cat /tmp/httpd-start.log 2>/dev/null || true
             cat /var/log/httpd/error_log 2>/dev/null || true
             exit 1
           fi
 
+          echo "httpd_crashed=false" >> "$GITHUB_OUTPUT"
           echo "✓ httpd started successfully"
           echo "  PID(s): $(pgrep -x httpd | tr '\n' ' ')"
 
@@ -344,7 +352,6 @@ jobs:
         run: |
           echo "[5/6] Verifying multi-user processes..."
 
-          # Give processes additional time to spawn after requests
           sleep 5
 
           echo "=== Process Tree ==="
@@ -358,7 +365,6 @@ jobs:
           echo "Apache user processes: $APACHE_PROCS (multiplexer)"
           echo "Testuser processes:    $TESTUSER_PROCS (workers)"
 
-          # FAIL if no testuser processes exist
           if [ "$TESTUSER_PROCS" -eq 0 ]; then
             echo ""
             echo "❌ FAIL: No httpd processes running as testuser!"
@@ -390,7 +396,6 @@ jobs:
 
           if [ -z "$CORE" ]; then
             echo "No core dump found in /tmp/coredumps or /tmp"
-            # Try systemd coredump
             if command -v coredumpctl &>/dev/null; then
               echo "=== Trying coredumpctl ==="
               coredumpctl list 2>&1 || true
@@ -402,15 +407,14 @@ jobs:
             HTTPD_BIN=$(which httpd)
             echo "httpd binary: $HTTPD_BIN"
 
-            # Create gdb command script
             cat > /tmp/gdb-commands.txt << 'GDBEOF'
-          set pagination off
-          bt full
-          info threads
-          thread apply all bt full
-          info registers
-          info sharedlibrary
-          GDBEOF
+            set pagination off
+            bt full
+            info threads
+            thread apply all bt full
+            info registers
+            info sharedlibrary
+            GDBEOF
 
             echo "=== Running gdb on core dump ==="
             gdb --batch \
@@ -427,31 +431,23 @@ jobs:
         run: |
           mkdir -p /tmp/debug-artifacts
 
-          # httpd logs
           cp /var/log/httpd/error_log /tmp/debug-artifacts/ 2>/dev/null || true
           cp /var/log/httpd/access_log /tmp/debug-artifacts/ 2>/dev/null || true
 
-          # httpd start output
           cp /tmp/httpd-start.log /tmp/debug-artifacts/ 2>/dev/null || true
 
-          # HTTP response bodies captured during test
           cp /tmp/response_*.html /tmp/debug-artifacts/ 2>/dev/null || true
 
-          # gdb backtrace (if produced)
           cp /tmp/backtrace.txt /tmp/debug-artifacts/ 2>/dev/null || true
           cp /tmp/coredump-info.txt /tmp/debug-artifacts/ 2>/dev/null || true
 
-          # Configuration files used for the test
           cp /etc/httpd/conf.modules.d/00-mpm.conf /tmp/debug-artifacts/ 2>/dev/null || true
           cp /etc/httpd/conf.d/peruser.conf /tmp/debug-artifacts/ 2>/dev/null || true
 
-          # Test file and its permissions
           ls -la /var/www/html/ > /tmp/debug-artifacts/webroot-perms.txt 2>/dev/null || true
 
-          # Core dumps
           find /tmp/coredumps -name "core.*" -exec cp {} /tmp/debug-artifacts/ \; 2>/dev/null || true
 
-          # SELinux denials (best effort)
           ausearch -m avc -ts recent 2>/dev/null > /tmp/debug-artifacts/selinux-denials.txt || true
 
           echo "=== Debug artifacts collected ==="
