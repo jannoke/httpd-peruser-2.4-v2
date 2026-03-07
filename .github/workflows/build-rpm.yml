@@ -341,6 +341,7 @@ jobs:
             CURL_EXIT=$?
 
             if [ "$CURL_EXIT" -eq 124 ]; then
+              # Exit code 124 = timeout command timed out after 5 seconds
               echo "❌ Request $i: curl timed out after 5 seconds"
               # Timeout is not a segfault - final check after loop handles segfault detection
               FAILED=1
