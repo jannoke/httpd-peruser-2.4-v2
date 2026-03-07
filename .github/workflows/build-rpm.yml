@@ -138,9 +138,9 @@ jobs:
         run: |
           echo "=== Available RPMs ==="
           find /tmp/rpms -name "*.rpm" | grep -v debuginfo | grep -v src
-          HTTPD_RPM=$(find /tmp/rpms -name "httpd-[0-9]*.rpm" | grep -v debuginfo | grep -v src | head -n 1)
-          echo "Installing: $HTTPD_RPM"
-          dnf install -y "$HTTPD_RPM"
+          RPMS=$(find /tmp/rpms -name "httpd-*.rpm" | grep -v debuginfo | grep -v src)
+          echo "Installing: $RPMS"
+          dnf install -y $RPMS
 
       - name: Install debug tools
         run: |
