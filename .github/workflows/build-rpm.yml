@@ -134,8 +134,8 @@ jobs:
           dnf install -y --setopt=install_weak_deps=False --allowerasing curl gdb procps-ng
           
           # Enable debuginfo repositories for better stack traces
-          dnf config-manager --set-enabled crb
           dnf install -y dnf-plugins-core || true
+          dnf config-manager --set-enabled crb
           
           dnf clean all
 
@@ -366,6 +366,7 @@ jobs:
             fi
 
             echo "✓ Request $i: HTTP $HTTP_CODE, content verified"
+            # Brief delay between requests to allow segfaults to manifest in logs
             sleep 1
           done
 
