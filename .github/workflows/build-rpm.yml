@@ -230,7 +230,9 @@ jobs:
           <VirtualHost *:8080>
               ServerName localhost
               DocumentRoot /var/www/html
-              AssignUserID testuser testuser
+              <IfModule peruser.c>
+                ServerEnvironment testuser
+              </IfModule>  
           </VirtualHost>
 
           Listen 8080
