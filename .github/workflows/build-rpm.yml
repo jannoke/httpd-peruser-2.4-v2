@@ -131,7 +131,7 @@ jobs:
 
       - name: Install httpd and dependencies
         run: |
-          dnf install -y --setopt=install_weak_deps=False httpd httpd-filesystem curl
+          dnf install -y --setopt=install_weak_deps=False --allowerasing httpd-filesystem curl
           dnf clean all
 
       - name: Install built peruser RPM
