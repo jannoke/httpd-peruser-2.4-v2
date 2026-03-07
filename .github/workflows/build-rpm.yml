@@ -537,7 +537,7 @@ jobs:
             thread apply all bt full
             info registers
             info sharedlibrary
-            GDBEOF
+          GDBEOF
 
             echo "=== Running gdb on core dump ==="
             gdb --batch \
