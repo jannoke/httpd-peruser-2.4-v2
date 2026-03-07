@@ -23,6 +23,7 @@ jobs:
 
       - name: Install build dependencies
         run: |
+          dnf install dnf-plugins-core
           dnf config-manager --set-enabled crb
           dnf install -y \
             rpm-build \
