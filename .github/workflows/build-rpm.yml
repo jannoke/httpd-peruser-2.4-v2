@@ -442,6 +442,45 @@ jobs:
           echo ""
           echo "=== All Tests PASSED ==="
 
+      - name: Check for runtime segfaults
+        id: check_segfaults
+        if: always()
+        run: |
+          echo "=== Checking for any segmentation faults in error log ==="
+          
+          if [ ! -f /var/log/httpd/error_log ]; then
+            echo "No error log found"
+            echo "segfault_detected=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
+          # Show full error log for debugging
+          echo "=== httpd error log ==="
+          cat /var/log/httpd/error_log
+          echo ""
+          
+          # Check for segfaults
+          if grep -i "exit signal.*fault\|exit signal.*abort" /var/log/httpd/error_log 2>/dev/null; then
+            echo ""
+            echo "❌ CRITICAL: Segmentation faults detected in error log!"
+            echo "segfault_detected=true" >> "$GITHUB_OUTPUT"
+            
+            # Count the segfaults
+            SEGFAULT_COUNT=$(grep -ci "exit signal.*fault\|exit signal.*abort" /var/log/httpd/error_log)
+            echo "Total segfaults detected: $SEGFAULT_COUNT"
+            
+            # Extract and display segfault lines
+            echo ""
+            echo "=== Segfault details ==="
+            grep -i "exit signal.*fault\|exit signal.*abort" /var/log/httpd/error_log
+            
+            # Fail the step to trigger gdb analysis
+            exit 1
+          else
+            echo "✓ No segmentation faults detected"
+            echo "segfault_detected=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Stop httpd
         if: always()
         run: |
@@ -457,7 +496,8 @@ jobs:
           failure() && (
             steps.httpd_start.outputs.httpd_crashed == 'true' ||
             steps.http_test.outputs.segfault_detected == 'true' ||
-            steps.verify_processes.outputs.segfault_detected == 'true'
+            steps.verify_processes.outputs.segfault_detected == 'true' ||
+            steps.check_segfaults.outputs.segfault_detected == 'true'
           )
         run: |
           echo "=== Searching for core dump ==="
