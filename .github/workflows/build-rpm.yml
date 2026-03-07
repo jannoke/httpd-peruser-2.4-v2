@@ -131,7 +131,7 @@ jobs:
 
       - name: Install base test dependencies
         run: |
-          dnf install -y --setopt=install_weak_deps=False --allowerasing curl gdb
+          dnf install -y --setopt=install_weak_deps=False --allowerasing curl gdb procps-ng
           dnf clean all
 
       - name: Install built peruser RPMs
@@ -257,11 +257,11 @@ jobs:
       - name: "[3/6] Start httpd"
         id: httpd_start
         run: |
-          echo "[3/6] Validating and starting httpd..."
+          echo "[3/6] Starting httpd in foreground mode..."
 
           ulimit -c unlimited
 
-          rm -f /run/httpd/httpd.pid /tmp/httpd-start.log /tmp/httpd-test.log
+          rm -f /run/httpd/httpd.pid /tmp/httpd-start.log /tmp/httpd-test.log /tmp/httpd-foreground.pid
           mkdir -p /run/httpd
 
           echo "--- httpd -t ---"
@@ -270,33 +270,29 @@ jobs:
           echo "--- httpd -M ---"
           httpd -M
 
-          timeout 15s httpd -k start > /tmp/httpd-start.log 2>&1
-          HTTPD_EXIT=$?
+          httpd -DFOREGROUND > /tmp/httpd-start.log 2>&1 &
+          HTTPD_PID=$!
+          echo "$HTTPD_PID" > /tmp/httpd-foreground.pid
 
-          if [ "$HTTPD_EXIT" -eq 124 ]; then
-            echo "ERROR: httpd start timed out"
+          echo "Started foreground httpd launcher PID: $HTTPD_PID"
+
+          STARTED=0
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if pgrep -x httpd > /dev/null; then
+              if curl -fsS -I http://127.0.0.1:8080/ > /tmp/httpd-test.log 2>&1; then
+                STARTED=1
+                break
+              fi
+            fi
+            sleep 1
+          done
+
+          if [ "$STARTED" -ne 1 ]; then
+            echo "ERROR: httpd did not become ready"
             echo "httpd_crashed=true" >> "$GITHUB_OUTPUT"
             cat /tmp/httpd-start.log 2>/dev/null || true
             cat /var/log/httpd/error_log 2>/dev/null || true
-            pgrep -a httpd 2>/dev/null || true
-            exit 1
-          fi
-
-          if [ "$HTTPD_EXIT" -ne 0 ]; then
-            echo "ERROR: httpd failed to start (exit code: $HTTPD_EXIT)"
-            echo "httpd_crashed=true" >> "$GITHUB_OUTPUT"
-            cat /tmp/httpd-start.log 2>/dev/null || true
-            cat /var/log/httpd/error_log 2>/dev/null || true
-            exit "$HTTPD_EXIT"
-          fi
-
-          sleep 3
-
-          if ! pgrep -x httpd > /dev/null; then
-            echo "ERROR: httpd process not found after start"
-            echo "httpd_crashed=true" >> "$GITHUB_OUTPUT"
-            cat /tmp/httpd-start.log 2>/dev/null || true
-            cat /var/log/httpd/error_log 2>/dev/null || true
+            ps auxf | grep -E "httpd|apache|testuser" | grep -v grep || true
             exit 1
           fi
 
@@ -391,11 +387,21 @@ jobs:
           echo ""
           echo "=== All Tests PASSED ==="
 
+      - name: Stop httpd
+        if: always()
+        run: |
+          if [ -f /tmp/httpd-foreground.pid ]; then
+            kill "$(cat /tmp/httpd-foreground.pid)" 2>/dev/null || true
+          fi
+          pkill -x httpd 2>/dev/null || true
+          sleep 2
+          pgrep -x httpd 2>/dev/null && pkill -9 -x httpd 2>/dev/null || true
+
       - name: Analyze core dump with gdb
         if: failure() && steps.httpd_start.outputs.httpd_crashed == 'true'
         run: |
           echo "=== Searching for core dump ==="
-          CORE=$(find /tmp/coredumps /tmp -name "core.*" -o -name "core" 2>/dev/null | head -n 1)
+          CORE=$(find /tmp/coredumps /tmp \( -name "core.*" -o -name "core" \) 2>/dev/null | head -n 1)
 
           if [ -z "$CORE" ]; then
             echo "No core dump found in /tmp/coredumps or /tmp"
@@ -436,21 +442,16 @@ jobs:
 
           cp /var/log/httpd/error_log /tmp/debug-artifacts/ 2>/dev/null || true
           cp /var/log/httpd/access_log /tmp/debug-artifacts/ 2>/dev/null || true
-
           cp /tmp/httpd-start.log /tmp/debug-artifacts/ 2>/dev/null || true
-
+          cp /tmp/httpd-test.log /tmp/debug-artifacts/ 2>/dev/null || true
           cp /tmp/response_*.html /tmp/debug-artifacts/ 2>/dev/null || true
-
           cp /tmp/backtrace.txt /tmp/debug-artifacts/ 2>/dev/null || true
           cp /tmp/coredump-info.txt /tmp/debug-artifacts/ 2>/dev/null || true
-
           cp /etc/httpd/conf.modules.d/00-mpm.conf /tmp/debug-artifacts/ 2>/dev/null || true
           cp /etc/httpd/conf.d/peruser.conf /tmp/debug-artifacts/ 2>/dev/null || true
 
           ls -la /var/www/html/ > /tmp/debug-artifacts/webroot-perms.txt 2>/dev/null || true
-
           find /tmp/coredumps -name "core.*" -exec cp {} /tmp/debug-artifacts/ \; 2>/dev/null || true
-
           ausearch -m avc -ts recent 2>/dev/null > /tmp/debug-artifacts/selinux-denials.txt || true
 
           echo "=== Debug artifacts collected ==="
