@@ -211,11 +211,11 @@ jobs:
           # Peruser MPM main configuration
           <IfModule mpm_peruser_module>
               ServerLimit          2
-              StartServers         1
               MinSpareProcessors   1
               MaxSpareProcessors   1
               MaxClients           10
               ExpireTimeout        5
+              IdleTimeout          300
           </IfModule>
 
           # Processor definition: runs as the dedicated testuser
