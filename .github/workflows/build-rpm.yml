@@ -135,7 +135,7 @@ jobs:
           
           # Enable debuginfo repositories for better stack traces
           dnf install -y dnf-plugins-core || true
-          dnf config-manager --set-enabled crb
+          dnf config-manager --set-enabled crb || true
           
           dnf clean all
 
@@ -323,10 +323,14 @@ jobs:
         run: |
           echo "[4/6] Testing HTTP requests..."
           FAILED=0
+          
+          # Pattern for detecting segfaults in error log
+          # Note: Pattern is duplicated across steps as GitHub Actions run blocks don't share shell variables
+          SEGFAULT_PATTERN="exit signal.*fault\|exit signal.*abort"
 
           for i in 1 2 3; do
             # Check for segfaults before each request
-            if grep -i "exit signal.*fault\|exit signal.*abort" /var/log/httpd/error_log 2>/dev/null; then
+            if grep -i "$SEGFAULT_PATTERN" /var/log/httpd/error_log 2>/dev/null; then
               echo "❌ Segmentation fault detected in error log before request $i"
               echo "segfault_detected=true" >> "$GITHUB_OUTPUT"
               FAILED=1
@@ -338,6 +342,7 @@ jobs:
 
             if [ "$CURL_EXIT" -eq 124 ]; then
               echo "❌ Request $i: curl timed out after 5 seconds"
+              # Timeout is not a segfault - final check after loop handles segfault detection
               FAILED=1
               continue
             fi
@@ -371,7 +376,7 @@ jobs:
           done
 
           # Final check for segfaults after all requests
-          if grep -i "exit signal.*fault\|exit signal.*abort" /var/log/httpd/error_log 2>/dev/null; then
+          if grep -i "$SEGFAULT_PATTERN" /var/log/httpd/error_log 2>/dev/null; then
             echo "❌ Segmentation fault detected in error log after requests"
             echo "segfault_detected=true" >> "$GITHUB_OUTPUT"
             FAILED=1
@@ -396,11 +401,14 @@ jobs:
         timeout-minutes: 1
         run: |
           echo "[5/6] Verifying multi-user processes..."
+          
+          # Pattern for detecting segfaults in error log
+          SEGFAULT_PATTERN="exit signal.*fault\|exit signal.*abort"
 
           sleep 5
 
           # Check for segfaults first
-          if grep -i "exit signal.*fault\|exit signal.*abort" /var/log/httpd/error_log 2>/dev/null; then
+          if grep -i "$SEGFAULT_PATTERN" /var/log/httpd/error_log 2>/dev/null; then
             echo "❌ FAIL: Segmentation faults detected in error log"
             echo "segfault_detected=true" >> "$GITHUB_OUTPUT"
             echo ""
@@ -450,6 +458,9 @@ jobs:
         run: |
           echo "=== Checking for any segmentation faults in error log ==="
           
+          # Pattern for detecting segfaults in error log
+          SEGFAULT_PATTERN="exit signal.*fault\|exit signal.*abort"
+          
           if [ ! -f /var/log/httpd/error_log ]; then
             echo "No error log found"
             echo "segfault_detected=false" >> "$GITHUB_OUTPUT"
@@ -462,19 +473,19 @@ jobs:
           echo ""
           
           # Check for segfaults
-          if grep -i "exit signal.*fault\|exit signal.*abort" /var/log/httpd/error_log 2>/dev/null; then
+          if grep -i "$SEGFAULT_PATTERN" /var/log/httpd/error_log 2>/dev/null; then
             echo ""
             echo "❌ CRITICAL: Segmentation faults detected in error log!"
             echo "segfault_detected=true" >> "$GITHUB_OUTPUT"
             
             # Count the segfaults
-            SEGFAULT_COUNT=$(grep -ci "exit signal.*fault\|exit signal.*abort" /var/log/httpd/error_log)
+            SEGFAULT_COUNT=$(grep -ci "$SEGFAULT_PATTERN" /var/log/httpd/error_log)
             echo "Total segfaults detected: $SEGFAULT_COUNT"
             
             # Extract and display segfault lines
             echo ""
             echo "=== Segfault details ==="
-            grep -i "exit signal.*fault\|exit signal.*abort" /var/log/httpd/error_log
+            grep -i "$SEGFAULT_PATTERN" /var/log/httpd/error_log
             
             # Fail the step to trigger gdb analysis
             exit 1
