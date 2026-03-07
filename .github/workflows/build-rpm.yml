@@ -139,8 +139,7 @@ jobs:
           echo "=== Available RPMs ==="
           find /tmp/rpms -name "*.rpm" | grep -vE 'debuginfo|debugsource|\.src\.rpm' || true
 
-          RPMS=$(find /tmp/rpms -name "*.rpm" \
-            | grep -E '/(httpd|mod_).+\.rpm$' \
+          RPMS=$(find /tmp/rpms -name "httpd-*.rpm" \
             | grep -vE 'debuginfo|debugsource|\.src\.rpm' \
             | sort)
 
@@ -189,6 +188,10 @@ jobs:
       - name: "[2/6] Configure httpd with peruser MPM"
         run: |
           echo "[2/6] Configuring httpd with peruser MPM..."
+
+          rm -f /etc/httpd/conf.d/ssl.conf
+          rm -f /etc/httpd/conf.modules.d/10-ssl.conf
+          rm -f /etc/httpd/conf.modules.d/*ssl*.conf
 
           cat > /etc/httpd/conf.modules.d/00-mpm.conf << 'EOF'
           # Only peruser MPM is loaded - all other MPMs are disabled
