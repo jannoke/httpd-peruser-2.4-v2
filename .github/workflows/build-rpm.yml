@@ -227,6 +227,11 @@ jobs:
           Processor testuser testuser
 
           # Virtual host on port 8080 with testuser worker processes
+          <Processor testuser>
+            User testuser
+            Group testuser
+          </Processor>
+
           <VirtualHost *:8080>
               ServerName localhost
               DocumentRoot /var/www/html
