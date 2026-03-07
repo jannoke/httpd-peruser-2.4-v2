@@ -131,7 +131,7 @@ jobs:
 
       - name: Install httpd and dependencies
         run: |
-          dnf install -y --setopt=install_weak_deps=False httpd httpd-filesystem
+          dnf install -y --setopt=install_weak_deps=False httpd httpd-filesystem curl
           dnf clean all
 
       - name: Install built peruser RPM
@@ -156,8 +156,42 @@ jobs:
           echo "/tmp/coredumps/core.%e.%p" > /proc/sys/kernel/core_pattern || true
           echo "Core pattern: $(cat /proc/sys/kernel/core_pattern)"
 
-      - name: Configure httpd for peruser MPM
+      - name: "[1/6] Create test user and files"
         run: |
+          echo "=== Starting Peruser MPM Functional Tests ==="
+          echo ""
+          echo "[1/6] Creating test user and files..."
+
+          # Create dedicated test user separate from apache
+          useradd -r -m -d /home/testuser -s /sbin/nologin testuser
+          echo "✓ Test user created: testuser (uid=$(id -u testuser))"
+
+          # Ensure document root exists
+          mkdir -p /var/www/html
+
+          # Create test HTML file with unique verifiable content
+          cat > /var/www/html/index.html << 'HTMLEOF'
+          <!DOCTYPE html>
+          <html>
+          <head><title>Peruser MPM Test</title></head>
+          <body>
+          <h1>Peruser MPM Test Page</h1>
+          <p>Test ID: PERUSER_TEST_12345</p>
+          <p>If you can read this, the file was served successfully!</p>
+          </body>
+          </html>
+          HTMLEOF
+
+          chown testuser:testuser /var/www/html/index.html
+          chmod 644 /var/www/html/index.html
+          echo "✓ Test file created: /var/www/html/index.html"
+          echo "  Owner: $(stat -c '%U:%G' /var/www/html/index.html)"
+          echo "  Perms: $(stat -c '%a' /var/www/html/index.html)"
+
+      - name: "[2/6] Configure httpd with peruser MPM"
+        run: |
+          echo "[2/6] Configuring httpd with peruser MPM..."
+
           # Ensure only the peruser MPM is loaded (disable all others)
           cat > /etc/httpd/conf.modules.d/00-mpm.conf << 'EOF'
           # Only peruser MPM is loaded - all other MPMs are disabled
@@ -175,41 +209,34 @@ jobs:
           #     gracefully (logs a warning and continues without it)
           cat > /etc/httpd/conf.d/peruser.conf << 'EOF'
           # Peruser MPM main configuration
-          <IfModule peruser.c>
-              ServerLimit          10
-              MaxClients           10
+          <IfModule mpm_peruser_module>
+              ServerLimit          2
+              StartServers         1
               MinSpareProcessors   1
-              MaxSpareProcessors   5
-              MinProcessors        0
-              MaxProcessors        5
-              MaxRequestsPerChild  100
-              ExpireTimeout        60
-              IdleTimeout          60
-              MinMultiplexers      1
-              MaxMultiplexers      3
-              MultiplexerIdleTimeout 60
-              ProcessorWaitTimeout 5
+              MaxSpareProcessors   1
+              MaxClients           10
+              ExpireTimeout        5
           </IfModule>
 
-          # Processor definition: runs as the 'apache' user
+          # Processor definition: runs as the dedicated testuser
           # Cgroup directives are intentionally omitted:
           #   Rocky Linux 9 uses cgroup v2 which is incompatible with the
           #   cgroup v1 paths used by the peruser Cgroup directive.
           #   Peruser will log a warning if a Cgroup path is set but
           #   inaccessible, and continues without cgroup isolation.
-          <Processor apache>
-              User  apache
-              Group apache
-          </Processor>
+          Processor testuser testuser
 
-          # Virtual host using the apache processor
-          <VirtualHost *:80>
+          # Virtual host on port 8080 with testuser worker processes
+          <VirtualHost *:8080>
               ServerName localhost
-              <IfModule peruser.c>
-                  ServerEnvironment apache
-              </IfModule>
+              DocumentRoot /var/www/html
+              AssignUserID testuser testuser
           </VirtualHost>
+
+          Listen 8080
           EOF
+
+          echo "✓ Configuration written"
 
           echo "=== /etc/httpd/conf.modules.d/00-mpm.conf ==="
           cat /etc/httpd/conf.modules.d/00-mpm.conf
@@ -222,43 +249,131 @@ jobs:
           httpd -t 2>&1
           SYNTAX_EXIT=$?
           echo "Syntax check exit code: $SYNTAX_EXIT"
+          if [ "$SYNTAX_EXIT" -eq 0 ]; then
+            echo "✓ Syntax check passed"
+          fi
           exit $SYNTAX_EXIT
 
-      - name: Start httpd with peruser MPM (httpd -X)
+      - name: "[3/6] Start httpd"
         id: httpd_start
         run: |
-          echo "Running: httpd -X (foreground, single-process mode)"
+          echo "[3/6] Starting httpd..."
 
           # Enable core dumps for this shell session
           ulimit -c unlimited
 
-          # Run httpd with a timeout and capture the exit code.
-          # timeout returns 124 when the time limit is reached (normal for a
-          # running server), or propagates httpd's own exit/signal code otherwise.
-          timeout 10 httpd -X 2>&1 | tee /tmp/httpd-output.log
-          HTTPD_EXIT=${PIPESTATUS[0]}
-          echo "timeout/httpd exit code: $HTTPD_EXIT"
+          # Start httpd in background mode
+          httpd -k start 2>&1 | tee /tmp/httpd-start.log
+          HTTPD_EXIT=$?
 
-          # timeout returns 124 on timeout (normal - server kept running)
-          if [ "$HTTPD_EXIT" -eq 124 ]; then
-            echo "SUCCESS: httpd started and ran for 10 seconds with peruser MPM"
-            exit 0
-          fi
-
-          # Exit codes 134 (SIGABRT) and 139 (SIGSEGV) indicate a crash
-          if [ "$HTTPD_EXIT" -eq 139 ] || [ "$HTTPD_EXIT" -eq 134 ]; then
-            echo "SEGFAULT DETECTED (exit code: $HTTPD_EXIT)"
-            echo "httpd_crashed=true" >> "$GITHUB_OUTPUT"
-            exit "$HTTPD_EXIT"
-          fi
-
-          # Any other non-zero exit is also a failure
           if [ "$HTTPD_EXIT" -ne 0 ]; then
-            echo "httpd exited with error code: $HTTPD_EXIT"
+            echo "ERROR: httpd failed to start (exit code: $HTTPD_EXIT)"
+            cat /tmp/httpd-start.log
+            cat /var/log/httpd/error_log 2>/dev/null || true
             exit "$HTTPD_EXIT"
           fi
 
-          echo "SUCCESS: httpd exited cleanly"
+          # Wait for httpd to fully start
+          sleep 3
+
+          # Verify it is actually running
+          if ! pgrep -x httpd > /dev/null; then
+            echo "ERROR: httpd process not found after start"
+            cat /var/log/httpd/error_log 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "✓ httpd started successfully"
+          echo "  PID(s): $(pgrep -x httpd | tr '\n' ' ')"
+
+      - name: "[4/6] Test HTTP requests"
+        run: |
+          echo "[4/6] Testing HTTP requests..."
+          FAILED=0
+
+          for i in 1 2 3; do
+            HTTP_CODE=$(curl -s -o /tmp/response_${i}.html -w "%{http_code}" http://localhost:8080/)
+            CURL_EXIT=$?
+
+            if [ "$CURL_EXIT" -ne 0 ]; then
+              echo "❌ Request $i: curl failed (exit code: $CURL_EXIT)"
+              FAILED=1
+              continue
+            fi
+
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "❌ Request $i: Expected HTTP 200, got $HTTP_CODE"
+              echo "   Response body:"
+              cat /tmp/response_${i}.html
+              FAILED=1
+              continue
+            fi
+
+            if ! grep -q "PERUSER_TEST_12345" /tmp/response_${i}.html; then
+              echo "❌ Request $i: HTTP $HTTP_CODE but response does not contain expected content"
+              echo "   Expected: PERUSER_TEST_12345"
+              echo "   Response was:"
+              cat /tmp/response_${i}.html
+              FAILED=1
+              continue
+            fi
+
+            echo "✓ Request $i: HTTP $HTTP_CODE, content verified"
+          done
+
+          if [ "$FAILED" -ne 0 ]; then
+            echo ""
+            echo "ERROR: One or more HTTP requests failed"
+            echo "=== Verbose curl output ==="
+            curl -v http://localhost:8080/ 2>&1 || true
+            echo "=== httpd error log ==="
+            cat /var/log/httpd/error_log 2>/dev/null || echo "(no error log)"
+            echo "=== httpd access log ==="
+            cat /var/log/httpd/access_log 2>/dev/null || echo "(no access log)"
+            exit 1
+          fi
+
+      - name: "[5/6] Verify multi-user processes"
+        run: |
+          echo "[5/6] Verifying multi-user processes..."
+
+          # Give processes additional time to spawn after requests
+          sleep 5
+
+          echo "=== Process Tree ==="
+          ps auxf | grep -E "httpd|apache|testuser" | grep -v grep || true
+
+          echo ""
+          echo "=== Process Count by User ==="
+          APACHE_PROCS=$(pgrep -u apache -x httpd 2>/dev/null | wc -l)
+          TESTUSER_PROCS=$(pgrep -u testuser -x httpd 2>/dev/null | wc -l)
+
+          echo "Apache user processes: $APACHE_PROCS (multiplexer)"
+          echo "Testuser processes:    $TESTUSER_PROCS (workers)"
+
+          # FAIL if no testuser processes exist
+          if [ "$TESTUSER_PROCS" -eq 0 ]; then
+            echo ""
+            echo "❌ FAIL: No httpd processes running as testuser!"
+            echo "Peruser MPM is NOT working - all processes running as apache user"
+            echo ""
+            echo "=== Full process list ==="
+            ps aux | grep -E "httpd|apache|testuser" | grep -v grep || true
+            echo "=== httpd error log ==="
+            cat /var/log/httpd/error_log 2>/dev/null || echo "(no error log)"
+            exit 1
+          fi
+
+          echo ""
+          echo "✓ Peruser MPM is working correctly!"
+          echo "  Found $TESTUSER_PROCS httpd worker process(es) running as testuser"
+
+      - name: "[6/6] Process tree summary"
+        run: |
+          echo "[6/6] Process tree:"
+          ps auxf | grep -E "httpd|apache|testuser" | grep -v grep || true
+          echo ""
+          echo "=== All Tests PASSED ==="
 
       - name: Analyze core dump with gdb
         if: failure() && steps.httpd_start.outputs.httpd_crashed == 'true'
@@ -305,11 +420,15 @@ jobs:
         run: |
           mkdir -p /tmp/debug-artifacts
 
-          # httpd error log
+          # httpd logs
           cp /var/log/httpd/error_log /tmp/debug-artifacts/ 2>/dev/null || true
+          cp /var/log/httpd/access_log /tmp/debug-artifacts/ 2>/dev/null || true
 
-          # httpd output captured during test
-          cp /tmp/httpd-output.log /tmp/debug-artifacts/ 2>/dev/null || true
+          # httpd start output
+          cp /tmp/httpd-start.log /tmp/debug-artifacts/ 2>/dev/null || true
+
+          # HTTP response bodies captured during test
+          cp /tmp/response_*.html /tmp/debug-artifacts/ 2>/dev/null || true
 
           # gdb backtrace (if produced)
           cp /tmp/backtrace.txt /tmp/debug-artifacts/ 2>/dev/null || true
@@ -319,14 +438,23 @@ jobs:
           cp /etc/httpd/conf.modules.d/00-mpm.conf /tmp/debug-artifacts/ 2>/dev/null || true
           cp /etc/httpd/conf.d/peruser.conf /tmp/debug-artifacts/ 2>/dev/null || true
 
+          # Test file and its permissions
+          ls -la /var/www/html/ > /tmp/debug-artifacts/webroot-perms.txt 2>/dev/null || true
+
           # Core dumps
           find /tmp/coredumps -name "core.*" -exec cp {} /tmp/debug-artifacts/ \; 2>/dev/null || true
+
+          # SELinux denials (best effort)
+          ausearch -m avc -ts recent 2>/dev/null > /tmp/debug-artifacts/selinux-denials.txt || true
 
           echo "=== Debug artifacts collected ==="
           ls -lh /tmp/debug-artifacts/
 
           echo "=== httpd error log ==="
           cat /tmp/debug-artifacts/error_log 2>/dev/null || echo "(no error log)"
+
+          echo "=== httpd access log ==="
+          cat /tmp/debug-artifacts/access_log 2>/dev/null || echo "(no access log)"
 
       - name: Upload debug artifacts
         if: always()
