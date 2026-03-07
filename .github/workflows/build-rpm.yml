@@ -1,0 +1,111 @@
+name: Build RPM Packages
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-rpm:
+    name: Build SRPM and RPM (Rocky Linux 9)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: rockylinux:9
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          dnf install -y \
+            rpm-build \
+            rpmdevtools \
+            dnf-plugins-core \
+            gcc \
+            autoconf \
+            pkgconfig \
+            findutils \
+            xmlto \
+            perl-interpreter \
+            perl-generators \
+            systemd-devel \
+            zlib-devel \
+            libselinux-devel \
+            lua-devel \
+            brotli-devel \
+            apr-devel \
+            apr-util-devel \
+            pcre-devel \
+            gnupg2 \
+            systemd-rpm-macros \
+            openssl-devel \
+            libtool \
+            which \
+            make \
+            libxml2-devel
+          dnf clean all
+
+      - name: Set up RPM build tree
+        run: rpmdev-setuptree
+
+      - name: Copy source files into rpmbuild tree
+        run: |
+          cp -r src/. "$HOME/rpmbuild/SOURCES/"
+          mv "$HOME/rpmbuild/SOURCES/httpd.spec" "$HOME/rpmbuild/SPECS/httpd.spec"
+
+      - name: Import GPG keys
+        run: gpg --import "$HOME/rpmbuild/SOURCES/KEYS" 2>/dev/null || true
+
+      - name: Build SRPM
+        run: |
+          rpmbuild -bs "$HOME/rpmbuild/SPECS/httpd.spec" 2>&1 | tee /tmp/srpm-build.log
+          BUILD_EXIT=${PIPESTATUS[0]}
+          echo "SRPM build exit code: $BUILD_EXIT"
+          exit $BUILD_EXIT
+
+      - name: Build RPM from SRPM
+        run: |
+          SRPM=$(find "$HOME/rpmbuild/SRPMS/" -name "*.src.rpm" | head -n 1)
+          echo "Building RPM from: $SRPM"
+          rpmbuild --rebuild "$SRPM" 2>&1 | tee /tmp/rpm-build.log
+          BUILD_EXIT=${PIPESTATUS[0]}
+          echo "RPM build exit code: $BUILD_EXIT"
+          exit $BUILD_EXIT
+
+      - name: List build artifacts
+        if: always()
+        run: |
+          echo "=== SRPMs ==="
+          find "$HOME/rpmbuild/SRPMS/" -name "*.src.rpm" 2>/dev/null || echo "No SRPMs found"
+          echo "=== RPMs ==="
+          find "$HOME/rpmbuild/RPMS/" -name "*.rpm" 2>/dev/null || echo "No RPMs found"
+
+      - name: Upload SRPM artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: srpm
+          path: ~/rpmbuild/SRPMS/*.src.rpm
+          if-no-files-found: warn
+
+      - name: Upload RPM artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpms
+          path: ~/rpmbuild/RPMS/**/*.rpm
+          if-no-files-found: warn
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: /tmp/*-build.log
+          if-no-files-found: ignore
