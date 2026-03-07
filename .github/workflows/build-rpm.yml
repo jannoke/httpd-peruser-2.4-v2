@@ -111,3 +111,227 @@ jobs:
           name: build-logs
           path: /tmp/*-build.log
           if-no-files-found: ignore
+
+  test-rpm:
+    name: Test Peruser MPM (Rocky Linux 9)
+    needs: build-rpm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    container:
+      image: rockylinux:9
+      options: --privileged
+
+    steps:
+      - name: Download built RPMs
+        uses: actions/download-artifact@v4
+        with:
+          name: rpms
+          path: /tmp/rpms
+
+      - name: Install httpd and dependencies
+        run: |
+          dnf install -y httpd httpd-filesystem
+          dnf clean all
+
+      - name: Install built peruser RPM
+        run: |
+          echo "=== Available RPMs ==="
+          find /tmp/rpms -name "*.rpm" | grep -v debuginfo | grep -v src
+          HTTPD_RPM=$(find /tmp/rpms -name "httpd-[0-9]*.rpm" | grep -v debuginfo | grep -v src | head -n 1)
+          echo "Installing: $HTTPD_RPM"
+          dnf install -y "$HTTPD_RPM"
+
+      - name: Install debug tools
+        run: |
+          dnf install -y gdb
+          # Install debuginfo if available (best effort)
+          dnf debuginfo-install -y httpd 2>/dev/null || true
+          dnf clean all
+
+      - name: Enable core dumps
+        run: |
+          ulimit -c unlimited
+          mkdir -p /tmp/coredumps
+          echo "/tmp/coredumps/core.%e.%p" > /proc/sys/kernel/core_pattern || true
+          echo "Core pattern: $(cat /proc/sys/kernel/core_pattern)"
+
+      - name: Configure httpd for peruser MPM
+        run: |
+          # Ensure only the peruser MPM is loaded (disable all others)
+          cat > /etc/httpd/conf.modules.d/00-mpm.conf << 'EOF'
+          # Only peruser MPM is loaded - all other MPMs are disabled
+          LoadModule mpm_peruser_module modules/mod_mpm_peruser.so
+          #LoadModule mpm_prefork_module modules/mod_mpm_prefork.so
+          #LoadModule mpm_worker_module modules/mod_mpm_worker.so
+          #LoadModule mpm_event_module modules/mod_mpm_event.so
+          EOF
+
+          # Write peruser-specific configuration
+          # Notes on cgroup:
+          #   - The original Cgroup directive used cgroup v1 paths (/dev/cgroup/...)
+          #   - Rocky Linux 9 uses cgroup v2 exclusively; cgroup v1 is not available
+          #   - Cgroup is therefore omitted here; peruser handles a missing cgroup
+          #     gracefully (logs a warning and continues without it)
+          cat > /etc/httpd/conf.d/peruser.conf << 'EOF'
+          # Peruser MPM main configuration
+          <IfModule peruser.c>
+              ServerLimit          10
+              MaxClients           10
+              MinSpareProcessors   1
+              MaxSpareProcessors   5
+              MinProcessors        0
+              MaxProcessors        5
+              MaxRequestsPerChild  100
+              ExpireTimeout        60
+              IdleTimeout          60
+              MinMultiplexers      1
+              MaxMultiplexers      3
+              MultiplexerIdleTimeout 60
+              ProcessorWaitTimeout 5
+          </IfModule>
+
+          # Processor definition: runs as the 'apache' user
+          # Cgroup directives are intentionally omitted:
+          #   Rocky Linux 9 uses cgroup v2 which is incompatible with the
+          #   cgroup v1 paths used by the peruser Cgroup directive.
+          #   Peruser will log a warning if a Cgroup path is set but
+          #   inaccessible, and continues without cgroup isolation.
+          <Processor apache>
+              User  apache
+              Group apache
+          </Processor>
+
+          # Virtual host using the apache processor
+          <VirtualHost *:80>
+              ServerName localhost
+              <IfModule peruser.c>
+                  ServerEnvironment apache
+              </IfModule>
+          </VirtualHost>
+          EOF
+
+          echo "=== /etc/httpd/conf.modules.d/00-mpm.conf ==="
+          cat /etc/httpd/conf.modules.d/00-mpm.conf
+          echo "=== /etc/httpd/conf.d/peruser.conf ==="
+          cat /etc/httpd/conf.d/peruser.conf
+
+      - name: Syntax check (httpd -t)
+        run: |
+          echo "Running: httpd -t"
+          httpd -t 2>&1
+          SYNTAX_EXIT=$?
+          echo "Syntax check exit code: $SYNTAX_EXIT"
+          exit $SYNTAX_EXIT
+
+      - name: Start httpd with peruser MPM (httpd -X)
+        id: httpd_start
+        run: |
+          echo "Running: httpd -X (foreground, single-process mode)"
+
+          # Enable core dumps for this shell session
+          ulimit -c unlimited
+
+          # Run httpd with a timeout and capture the exit code.
+          # timeout returns 124 when the time limit is reached (normal for a
+          # running server), or propagates httpd's own exit/signal code otherwise.
+          timeout 10 httpd -X 2>&1 | tee /tmp/httpd-output.log
+          HTTPD_EXIT=${PIPESTATUS[0]}
+          echo "timeout/httpd exit code: $HTTPD_EXIT"
+
+          # timeout returns 124 on timeout (normal - server kept running)
+          if [ "$HTTPD_EXIT" -eq 124 ]; then
+            echo "SUCCESS: httpd started and ran for 10 seconds with peruser MPM"
+            exit 0
+          fi
+
+          # Exit codes 134 (SIGABRT) and 139 (SIGSEGV) indicate a crash
+          if [ "$HTTPD_EXIT" -eq 139 ] || [ "$HTTPD_EXIT" -eq 134 ]; then
+            echo "SEGFAULT DETECTED (exit code: $HTTPD_EXIT)"
+            echo "httpd_crashed=true" >> "$GITHUB_OUTPUT"
+            exit "$HTTPD_EXIT"
+          fi
+
+          # Any other non-zero exit is also a failure
+          if [ "$HTTPD_EXIT" -ne 0 ]; then
+            echo "httpd exited with error code: $HTTPD_EXIT"
+            exit "$HTTPD_EXIT"
+          fi
+
+          echo "SUCCESS: httpd exited cleanly"
+
+      - name: Analyze core dump with gdb
+        if: failure() && steps.httpd_start.outputs.httpd_crashed == 'true'
+        run: |
+          echo "=== Searching for core dump ==="
+          CORE=$(find /tmp/coredumps /tmp -name "core.*" -o -name "core" 2>/dev/null | head -n 1)
+
+          if [ -z "$CORE" ]; then
+            echo "No core dump found in /tmp/coredumps or /tmp"
+            # Try systemd coredump
+            if command -v coredumpctl &>/dev/null; then
+              echo "=== Trying coredumpctl ==="
+              coredumpctl list 2>&1 || true
+              coredumpctl info httpd 2>&1 | tee /tmp/coredump-info.txt || true
+            fi
+          else
+            echo "Found core dump: $CORE"
+
+            HTTPD_BIN=$(which httpd)
+            echo "httpd binary: $HTTPD_BIN"
+
+            # Create gdb command script
+            cat > /tmp/gdb-commands.txt << 'GDBEOF'
+          set pagination off
+          bt full
+          info threads
+          thread apply all bt full
+          info registers
+          info sharedlibrary
+          GDBEOF
+
+            echo "=== Running gdb on core dump ==="
+            gdb --batch \
+              -x /tmp/gdb-commands.txt \
+              "$HTTPD_BIN" "$CORE" \
+              2>&1 | tee /tmp/backtrace.txt
+
+            echo "=== GDB Backtrace Summary ==="
+            cat /tmp/backtrace.txt
+          fi
+
+      - name: Collect debug artifacts
+        if: always()
+        run: |
+          mkdir -p /tmp/debug-artifacts
+
+          # httpd error log
+          cp /var/log/httpd/error_log /tmp/debug-artifacts/ 2>/dev/null || true
+
+          # httpd output captured during test
+          cp /tmp/httpd-output.log /tmp/debug-artifacts/ 2>/dev/null || true
+
+          # gdb backtrace (if produced)
+          cp /tmp/backtrace.txt /tmp/debug-artifacts/ 2>/dev/null || true
+          cp /tmp/coredump-info.txt /tmp/debug-artifacts/ 2>/dev/null || true
+
+          # Configuration files used for the test
+          cp /etc/httpd/conf.modules.d/00-mpm.conf /tmp/debug-artifacts/ 2>/dev/null || true
+          cp /etc/httpd/conf.d/peruser.conf /tmp/debug-artifacts/ 2>/dev/null || true
+
+          # Core dumps
+          find /tmp/coredumps -name "core.*" -exec cp {} /tmp/debug-artifacts/ \; 2>/dev/null || true
+
+          echo "=== Debug artifacts collected ==="
+          ls -lh /tmp/debug-artifacts/
+
+          echo "=== httpd error log ==="
+          cat /tmp/debug-artifacts/error_log 2>/dev/null || echo "(no error log)"
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-artifacts
+          path: /tmp/debug-artifacts/
+          if-no-files-found: ignore
