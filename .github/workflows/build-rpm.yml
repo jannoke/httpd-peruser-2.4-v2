@@ -132,6 +132,11 @@ jobs:
       - name: Install base test dependencies
         run: |
           dnf install -y --setopt=install_weak_deps=False --allowerasing curl gdb procps-ng
+          
+          # Enable debuginfo repositories for better stack traces
+          dnf install -y dnf-plugins-core || true
+          dnf config-manager --set-enabled crb || true
+          
           dnf clean all
 
       - name: Install built peruser RPMs
@@ -147,6 +152,17 @@ jobs:
           printf '%s\n' $RPMS
 
           dnf install -y --allowerasing --setopt=install_weak_deps=False $RPMS
+          
+          # Install debuginfo packages if available for better stack traces
+          DEBUGINFO_RPMS=$(find /tmp/rpms -name "httpd-debuginfo-*.rpm" 2>/dev/null | sort)
+          if [ -n "$DEBUGINFO_RPMS" ]; then
+            echo "=== Installing debuginfo packages ==="
+            printf '%s\n' $DEBUGINFO_RPMS
+            dnf install -y --allowerasing $DEBUGINFO_RPMS || echo "Warning: debuginfo installation failed"
+          else
+            echo "No debuginfo packages found (this is expected)"
+          fi
+          
           dnf clean all
 
       - name: Enable core dumps
@@ -256,6 +272,7 @@ jobs:
 
       - name: "[3/6] Start httpd"
         id: httpd_start
+        timeout-minutes: 1
         run: |
           echo "[3/6] Starting httpd in foreground mode..."
 
@@ -279,7 +296,7 @@ jobs:
           STARTED=0
           for i in 1 2 3 4 5 6 7 8 9 10; do
             if pgrep -x httpd > /dev/null; then
-              if curl -fsS -I http://127.0.0.1:8080/ > /tmp/httpd-test.log 2>&1; then
+              if timeout 5 curl -fsS -I http://127.0.0.1:8080/ > /tmp/httpd-test.log 2>&1; then
                 STARTED=1
                 break
               fi
@@ -301,13 +318,35 @@ jobs:
           echo "  PID(s): $(pgrep -x httpd | tr '\n' ' ')"
 
       - name: "[4/6] Test HTTP requests"
+        id: http_test
+        timeout-minutes: 2
         run: |
           echo "[4/6] Testing HTTP requests..."
           FAILED=0
+          
+          # Pattern for detecting segfaults in error log
+          # Note: Pattern is duplicated across steps as GitHub Actions run blocks don't share shell variables
+          SEGFAULT_PATTERN="exit signal.*fault\|exit signal.*abort"
 
           for i in 1 2 3; do
-            HTTP_CODE=$(curl -s -o /tmp/response_${i}.html -w "%{http_code}" http://localhost:8080/)
+            # Check for segfaults before each request
+            if grep -i "$SEGFAULT_PATTERN" /var/log/httpd/error_log 2>/dev/null; then
+              echo "❌ Segmentation fault detected in error log before request $i"
+              echo "segfault_detected=true" >> "$GITHUB_OUTPUT"
+              FAILED=1
+              break
+            fi
+
+            HTTP_CODE=$(timeout 5 curl -s -o /tmp/response_${i}.html -w "%{http_code}" http://localhost:8080/)
             CURL_EXIT=$?
+
+            if [ "$CURL_EXIT" -eq 124 ]; then
+              # Exit code 124 = timeout command timed out after 5 seconds
+              echo "❌ Request $i: curl timed out after 5 seconds"
+              # Timeout is not a segfault - final check after loop handles segfault detection
+              FAILED=1
+              continue
+            fi
 
             if [ "$CURL_EXIT" -ne 0 ]; then
               echo "❌ Request $i: curl failed (exit code: $CURL_EXIT)"
@@ -333,13 +372,24 @@ jobs:
             fi
 
             echo "✓ Request $i: HTTP $HTTP_CODE, content verified"
+            # Brief delay between requests to allow segfaults to manifest in logs
+            sleep 1
           done
+
+          # Final check for segfaults after all requests
+          if grep -i "$SEGFAULT_PATTERN" /var/log/httpd/error_log 2>/dev/null; then
+            echo "❌ Segmentation fault detected in error log after requests"
+            echo "segfault_detected=true" >> "$GITHUB_OUTPUT"
+            FAILED=1
+          else
+            echo "segfault_detected=false" >> "$GITHUB_OUTPUT"
+          fi
 
           if [ "$FAILED" -ne 0 ]; then
             echo ""
-            echo "ERROR: One or more HTTP requests failed"
+            echo "ERROR: One or more HTTP requests failed or segfaults detected"
             echo "=== Verbose curl output ==="
-            curl -v http://localhost:8080/ 2>&1 || true
+            timeout 5 curl -v http://localhost:8080/ 2>&1 || true
             echo "=== httpd error log ==="
             cat /var/log/httpd/error_log 2>/dev/null || echo "(no error log)"
             echo "=== httpd access log ==="
@@ -348,10 +398,25 @@ jobs:
           fi
 
       - name: "[5/6] Verify multi-user processes"
+        id: verify_processes
+        timeout-minutes: 1
         run: |
           echo "[5/6] Verifying multi-user processes..."
+          
+          # Pattern for detecting segfaults in error log
+          SEGFAULT_PATTERN="exit signal.*fault\|exit signal.*abort"
 
           sleep 5
+
+          # Check for segfaults first
+          if grep -i "$SEGFAULT_PATTERN" /var/log/httpd/error_log 2>/dev/null; then
+            echo "❌ FAIL: Segmentation faults detected in error log"
+            echo "segfault_detected=true" >> "$GITHUB_OUTPUT"
+            echo ""
+            echo "=== httpd error log with segfaults ==="
+            cat /var/log/httpd/error_log 2>/dev/null || echo "(no error log)"
+            exit 1
+          fi
 
           echo "=== Process Tree ==="
           ps auxf | grep -E "httpd|apache|testuser" | grep -v grep || true
@@ -376,6 +441,7 @@ jobs:
             exit 1
           fi
 
+          echo "segfault_detected=false" >> "$GITHUB_OUTPUT"
           echo ""
           echo "✓ Peruser MPM is working correctly!"
           echo "  Found $TESTUSER_PROCS httpd worker process(es) running as testuser"
@@ -386,6 +452,48 @@ jobs:
           ps auxf | grep -E "httpd|apache|testuser" | grep -v grep || true
           echo ""
           echo "=== All Tests PASSED ==="
+
+      - name: Check for runtime segfaults
+        id: check_segfaults
+        if: always()
+        run: |
+          echo "=== Checking for any segmentation faults in error log ==="
+          
+          # Pattern for detecting segfaults in error log
+          SEGFAULT_PATTERN="exit signal.*fault\|exit signal.*abort"
+          
+          if [ ! -f /var/log/httpd/error_log ]; then
+            echo "No error log found"
+            echo "segfault_detected=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          
+          # Show full error log for debugging
+          echo "=== httpd error log ==="
+          cat /var/log/httpd/error_log
+          echo ""
+          
+          # Check for segfaults
+          if grep -i "$SEGFAULT_PATTERN" /var/log/httpd/error_log 2>/dev/null; then
+            echo ""
+            echo "❌ CRITICAL: Segmentation faults detected in error log!"
+            echo "segfault_detected=true" >> "$GITHUB_OUTPUT"
+            
+            # Count the segfaults
+            SEGFAULT_COUNT=$(grep -ci "$SEGFAULT_PATTERN" /var/log/httpd/error_log)
+            echo "Total segfaults detected: $SEGFAULT_COUNT"
+            
+            # Extract and display segfault lines
+            echo ""
+            echo "=== Segfault details ==="
+            grep -i "$SEGFAULT_PATTERN" /var/log/httpd/error_log
+            
+            # Fail the step to trigger gdb analysis
+            exit 1
+          else
+            echo "✓ No segmentation faults detected"
+            echo "segfault_detected=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Stop httpd
         if: always()
@@ -398,7 +506,13 @@ jobs:
           pgrep -x httpd 2>/dev/null && pkill -9 -x httpd 2>/dev/null || true
 
       - name: Analyze core dump with gdb
-        if: failure() && steps.httpd_start.outputs.httpd_crashed == 'true'
+        if: |
+          failure() && (
+            steps.httpd_start.outputs.httpd_crashed == 'true' ||
+            steps.http_test.outputs.segfault_detected == 'true' ||
+            steps.verify_processes.outputs.segfault_detected == 'true' ||
+            steps.check_segfaults.outputs.segfault_detected == 'true'
+          )
         run: |
           echo "=== Searching for core dump ==="
           CORE=$(find /tmp/coredumps /tmp \( -name "core.*" -o -name "core" \) 2>/dev/null | head -n 1)
