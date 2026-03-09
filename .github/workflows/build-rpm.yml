@@ -131,7 +131,7 @@ jobs:
 
       - name: Install base test dependencies
         run: |
-          dnf install -y --setopt=install_weak_deps=False --allowerasing curl gdb procps-ng which
+          dnf install -y --setopt=install_weak_deps=False --allowerasing curl gdb procps-ng which systemd-coredump
           
           # Enable debuginfo repositories for better stack traces
           dnf install -y dnf-plugins-core || true
@@ -169,8 +169,29 @@ jobs:
         run: |
           ulimit -c unlimited
           mkdir -p /tmp/coredumps
-          echo "/tmp/coredumps/core.%e.%p" > /proc/sys/kernel/core_pattern || true
-          echo "Core pattern: $(cat /proc/sys/kernel/core_pattern)"
+
+          # Attempt to set core_pattern (may be read-only in containers)
+          echo "/tmp/coredumps/core.%e.%p" > /proc/sys/kernel/core_pattern 2>/dev/null || true
+
+          # Always show the actual core_pattern so we know what is in effect
+          ACTUAL_PATTERN=$(cat /proc/sys/kernel/core_pattern)
+          echo "Core pattern is: $ACTUAL_PATTERN"
+
+          # Diagnose which core-dump mechanism is active
+          if echo "$ACTUAL_PATTERN" | grep -q "systemd-coredump"; then
+            echo "systemd-coredump is active - cores will be managed by systemd-coredump"
+            if command -v coredumpctl &>/dev/null; then
+              echo "coredumpctl is available (systemd-coredump package installed)"
+            else
+              echo "Warning: coredumpctl not found despite systemd-coredump pattern"
+            fi
+          elif echo "$ACTUAL_PATTERN" | grep -q "^/tmp/coredumps"; then
+            echo "Core dumps will be written directly to /tmp/coredumps/"
+          else
+            echo "Warning: core_pattern could not be changed (likely read-only in container)"
+            echo "Core dumps may be routed to host systemd-coredump or lost"
+            echo "Installed coredumpctl: $(command -v coredumpctl || echo 'not found')"
+          fi
 
       - name: "[1/6] Create test user and files"
         run: |
@@ -514,40 +535,72 @@ jobs:
             steps.check_segfaults.outputs.segfault_detected == 'true'
           )
         run: |
-          echo "=== Searching for core dump ==="
-          CORE=$(find /tmp/coredumps /tmp \( -name "core.*" -o -name "core" \) 2>/dev/null | head -n 1)
+          echo "=== Core Dump Analysis ==="
+          echo "Current core_pattern: $(cat /proc/sys/kernel/core_pattern)"
 
-          if [ -z "$CORE" ]; then
-            echo "No core dump found in /tmp/coredumps or /tmp"
-            if command -v coredumpctl &>/dev/null; then
-              echo "=== Trying coredumpctl ==="
-              coredumpctl list 2>&1 || true
-              coredumpctl info httpd 2>&1 | tee /tmp/coredump-info.txt || true
+          CORE=""
+          HTTPD_BIN=$(which httpd 2>/dev/null || echo "/usr/sbin/httpd")
+
+          # Try coredumpctl first (handles systemd-coredump-managed cores)
+          if command -v coredumpctl &>/dev/null; then
+            echo "=== Available core dumps (coredumpctl list) ==="
+            coredumpctl list 2>&1 || true
+
+            echo "=== httpd core dump info ==="
+            if coredumpctl info httpd 2>&1 | tee /tmp/coredump-info.txt; then
+              echo "Extracting httpd core dump via coredumpctl..."
+              if coredumpctl dump httpd -o /tmp/core.httpd 2>/tmp/coredumpctl-dump.err; then
+                CORE=/tmp/core.httpd
+                echo "Core extracted to: $CORE"
+              else
+                echo "coredumpctl dump failed:"
+                cat /tmp/coredumpctl-dump.err || true
+              fi
+            else
+              echo "No httpd core dumps found via coredumpctl"
             fi
           else
-            echo "Found core dump: $CORE"
+            echo "coredumpctl not available"
+          fi
 
-            HTTPD_BIN=$(which httpd)
-            echo "httpd binary: $HTTPD_BIN"
+          # Fall back to searching common locations
+          if [ -z "$CORE" ]; then
+            echo "=== Searching for core files in /tmp/coredumps and /tmp ==="
+            CORE=$(find /tmp/coredumps /tmp \( -name "core.*" -o -name "core" \) 2>/dev/null | head -n 1)
+            if [ -n "$CORE" ]; then
+              echo "Found core dump: $CORE"
+            fi
+          fi
 
-            cat > /tmp/gdb-commands.txt << 'GDBEOF'
-            set pagination off
-            bt full
-            info threads
-            thread apply all bt full
-            info registers
-            info sharedlibrary
+          if [ -z "$CORE" ]; then
+            echo "No core dump found via coredumpctl or in /tmp/coredumps or /tmp"
+            echo "Possible reasons:"
+            echo "  - core_pattern setting in this container: $(cat /proc/sys/kernel/core_pattern)"
+            echo "  - Core dumps are being captured by the host system's coredump handler"
+            echo "  - systemd-coredump journal may not be accessible from inside the container"
+            exit 0
+          fi
+
+          echo "Analyzing core dump: $CORE"
+          echo "httpd binary: $HTTPD_BIN"
+
+          cat > /tmp/gdb-commands.txt << 'GDBEOF'
+          set pagination off
+          bt full
+          info threads
+          thread apply all bt full
+          info registers
+          info sharedlibrary
           GDBEOF
 
-            echo "=== Running gdb on core dump ==="
-            gdb --batch \
-              -x /tmp/gdb-commands.txt \
-              "$HTTPD_BIN" "$CORE" \
-              2>&1 | tee /tmp/backtrace.txt
+          echo "=== Running gdb on core dump ==="
+          gdb --batch \
+            -x /tmp/gdb-commands.txt \
+            "$HTTPD_BIN" "$CORE" \
+            2>&1 | tee /tmp/backtrace.txt
 
-            echo "=== GDB Backtrace Summary ==="
-            cat /tmp/backtrace.txt
-          fi
+          echo "=== GDB Backtrace Summary ==="
+          cat /tmp/backtrace.txt
 
       - name: Collect debug artifacts
         if: always()
