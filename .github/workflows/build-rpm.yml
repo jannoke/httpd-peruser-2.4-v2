@@ -169,9 +169,19 @@ jobs:
         run: |
           ulimit -c unlimited
           mkdir -p /tmp/coredumps
+          # World-writable with sticky bit so any user (e.g. testuser) can write core files
+          chmod 1777 /tmp/coredumps
 
           # Attempt to set core_pattern (may be read-only in containers)
           echo "/tmp/coredumps/core.%e.%p" > /proc/sys/kernel/core_pattern 2>/dev/null || true
+
+          # Allow setuid/setgid processes to produce core dumps.
+          # Peruser MPM child processes call setuid() to switch to the target user;
+          # the kernel clears the dumpable bit on setuid, so without this setting
+          # no core file is written even when ulimit -c is unlimited.
+          # Value 1: core written by the process user to the core_pattern path.
+          echo 1 > /proc/sys/fs/suid_dumpable 2>/dev/null || true
+          echo "suid_dumpable is: $(cat /proc/sys/fs/suid_dumpable 2>/dev/null || echo 'unknown')"
 
           # Always show the actual core_pattern so we know what is in effect
           ACTUAL_PATTERN=$(cat /proc/sys/kernel/core_pattern)
@@ -240,6 +250,10 @@ jobs:
 
           cat > /etc/httpd/conf.d/peruser.conf << 'EOF'
           ServerName localhost
+
+          # Tell Apache where to write core dumps; also activates the corelimit patch
+          # which raises RLIMIT_CORE so child processes can actually produce a dump.
+          CoreDumpDirectory /tmp/coredumps
 
           <IfModule mpm_peruser_module>
               ServerLimit          10

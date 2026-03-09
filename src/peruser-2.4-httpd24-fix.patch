@@ -603,6 +603,9 @@
 +
 +#include <signal.h>
 +#include <sys/times.h>
++#ifdef __linux__
++#include <sys/prctl.h>
++#endif
 +
 +#ifdef PERUSER_MAX_CPU_USAGE
 +#include "cpu_usage.h"
@@ -2384,6 +2387,20 @@
 +                     "setuid: unable to change to uid: %ld", (long) senv->uid);
 +        return -1;
 +    }
++
++#ifdef __linux__
++    /* Re-enable core dumps after setuid().
++     * setuid() clears the kernel's dumpable bit, which prevents core files
++     * from being written even when ulimit -c is unlimited.  Explicitly mark
++     * this child process as dumpable so that a crash produces a core file
++     * for debugging (subject to fs.suid_dumpable kernel setting >= 1). */
++    if (prctl(PR_SET_DUMPABLE, 1) != 0) {
++        ap_log_error(APLOG_MARK, APLOG_WARNING, errno, ap_server_conf,
++                     "prctl(PR_SET_DUMPABLE): could not re-enable core dumps "
++                     "for child pid %d (uid %ld); crash core files may not be "
++                     "produced", (int)getpid(), (long)senv->uid);
++    }
++#endif
 +
 +    return 0;
 +}
