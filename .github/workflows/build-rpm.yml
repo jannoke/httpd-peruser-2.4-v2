@@ -131,7 +131,7 @@ jobs:
 
       - name: Install base test dependencies
         run: |
-          dnf install -y --setopt=install_weak_deps=False --allowerasing curl gdb procps-ng which systemd-coredump
+          dnf install -y --setopt=install_weak_deps=False --allowerasing curl gdb procps-ng which
           
           # Enable debuginfo repositories for better stack traces
           dnf install -y dnf-plugins-core || true
