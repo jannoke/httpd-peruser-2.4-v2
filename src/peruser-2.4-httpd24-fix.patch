@@ -3356,6 +3356,24 @@
 + * Executive routines.
 + */
 +
++/* Callback function for ap_reclaim_child_processes() to note when a child
++ * process is killed. Updates scoreboard and runs child status hooks.
++ */
++static void peruser_note_child_killed(int childnum, pid_t pid,
++                                      ap_generation_t gen)
++{
++    if (childnum != -1) { /* child had a scoreboard slot? */
++        ap_run_child_status(ap_server_conf,
++                            ap_scoreboard_image->parent[childnum].pid,
++                            ap_scoreboard_image->parent[childnum].generation,
++                            childnum, MPM_CHILD_EXITED);
++        ap_scoreboard_image->parent[childnum].pid = 0;
++    }
++    else {
++        ap_run_child_status(ap_server_conf, pid, gen, -1, MPM_CHILD_EXITED);
++    }
++}
++
 +static int peruser_run(apr_pool_t *_pconf, apr_pool_t *plog, server_rec *s)
 +{
 +    int i;
@@ -3585,7 +3603,8 @@
 +            ap_log_error(APLOG_MARK, APLOG_WARNING, errno, ap_server_conf,
 +                         "killpg SIGTERM");
 +        }
-+        ap_reclaim_child_processes(1, NULL); /* Start with SIGTERM */
++        ap_reclaim_child_processes(1, /* Start with SIGTERM */
++                                   peruser_note_child_killed);
 +
 +        /* cleanup pid file on normal shutdown */
 +        {
@@ -3677,7 +3696,8 @@
 +            ap_log_error(APLOG_MARK, APLOG_WARNING, errno, ap_server_conf,
 +                         "killpg SIGHUP");
 +        }
-+        ap_reclaim_child_processes(0, NULL); /* Not when just starting up */
++        ap_reclaim_child_processes(0, /* Not when just starting up */
++                                   peruser_note_child_killed);
 +        ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, ap_server_conf,
 +                     "SIGHUP received.  Attempting to restart");
 +    }
