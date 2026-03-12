@@ -526,7 +526,7 @@
 +
 +/* Peruser version 0.4.0 */
 +
-+/* #define MPM_PERUSER_DEBUG */
++#define MPM_PERUSER_DEBUG
 +/* #define PERUSER_MAX_CPU_USAGE */
 +/* #define PERUSER_PAM_SESSION */
 +
@@ -1189,6 +1189,12 @@
 +int reap_children(int *exitcode, apr_exit_why_e *status)
 +{
 +    int n, pid;
++
++    if (ap_scoreboard_image == NULL) {
++        ap_log_error(APLOG_MARK, APLOG_EMERG, 0, NULL,
++                     "peruser: reap_children: ap_scoreboard_image is NULL");
++        return 0;
++    }
 +
 +    for (n = 0; n < NUM_CHILDS; ++n) {
 +        if (ap_scoreboard_image->servers[n][0].status != SERVER_DEAD) {
@@ -2294,6 +2300,14 @@
 +
 +    _DBG("function called");
 +
++    if (senv == NULL) {
++        ap_log_error(APLOG_MARK, APLOG_EMERG, 0, NULL,
++                     "peruser: peruser_setup_child: senv is NULL for childnum %d"
++                     " (CHILD_INFO_TABLE=%p, child_info_image=%p)",
++                     childnum, (void *)CHILD_INFO_TABLE, (void *)child_info_image);
++        return -1;
++    }
++
 +    if (senv->nice_lvl != 0) {
 +        nice(senv->nice_lvl);
 +    }
@@ -2536,6 +2550,25 @@
 +    setpgid(ap_my_pid, ap_my_pid); 
 +    requests_this_child = 0;
 +
++    /* Validate shared memory tables before any access */
++    if (CHILD_INFO_TABLE == NULL) {
++        ap_log_error(APLOG_MARK, APLOG_EMERG, 0, NULL,
++                     "peruser: child_main: CHILD_INFO_TABLE is NULL"
++                     " (child_info_image=%p, child_num=%d)",
++                     (void *)child_info_image, my_child_num);
++        clean_child_exit(APEXIT_CHILDFATAL);
++    }
++
++    if (CHILD_INFO_TABLE[my_child_num].senv == NULL) {
++        ap_log_error(APLOG_MARK, APLOG_EMERG, 0, NULL,
++                     "peruser: child_main: senv is NULL for child %d"
++                     " (type=%d, status=%d)",
++                     my_child_num,
++                     CHILD_INFO_TABLE[my_child_num].type,
++                     CHILD_INFO_TABLE[my_child_num].status);
++        clean_child_exit(APEXIT_CHILDFATAL);
++    }
++
 +    _DBG("sock_fd_in=%d sock_fd_out=%d",
 +            CHILD_INFO_TABLE[my_child_num].senv->input,
 +            CHILD_INFO_TABLE[my_child_num].senv->output);
@@ -2611,6 +2644,10 @@
 +    for (lr = ap_listeners, i = 0; i < num_listensocks; lr = lr->next, i++) {
 +        listensocks[i].accept_func = lr->accept_func;
 +        listensocks[i].sd = lr->sd;
++        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL,
++                     "peruser: child_main: listensock[%d] accept_func=%p sd=%p"
++                     " (child=%d)", i, (void *)lr->accept_func,
++                     (void *)lr->sd, my_child_num);
 +    }
 +
 +    pollset = apr_palloc(pchild, sizeof(*pollset) * num_listensocks);
@@ -2716,6 +2753,13 @@
 +        /* if we accept() something we don't want to die, so we have to
 +         * defer the exit
 +         */
++        if (listensocks[offset].accept_func == NULL) {
++            ap_log_error(APLOG_MARK, APLOG_EMERG, 0, NULL,
++                         "peruser: child_main: accept_func is NULL for"
++                         " listensock[%d] (sd=%p, child=%d)",
++                         offset, (void *)listensocks[offset].sd, my_child_num);
++            clean_child_exit(APEXIT_CHILDFATAL);
++        }
 +        status = listensocks[offset].accept_func((void *) &sock,
 +                                                 &listensocks[offset], ptrans);
 +
