@@ -4,6 +4,8 @@
 FROM almalinux:9
 
 # Install build dependencies
+RUN dnf install dnf-plugins-core -y
+RUN dnf config-manager --set-enabled crb
 RUN dnf install -y \
     rpm-build \
     rpmdevtools \
@@ -29,6 +31,7 @@ RUN dnf install -y \
     libtool \
     which \
     make \
+    libxml2-devel \
     && dnf clean all
 
 # Set up rpmbuild directory structure
