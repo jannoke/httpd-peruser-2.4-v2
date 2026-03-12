@@ -367,11 +367,10 @@ export LYNX_PATH=/usr/bin/links
         --enable-pie \
         --with-pcre=/usr/bin/pcre-config \
         --enable-mods-shared=all \
-        --enable-ssl --with-ssl --disable-distcache \
+        --enable-ssl --disable-distcache \
         --enable-proxy --enable-proxy-fdpass \
         --enable-cache \
         --enable-disk-cache \
-        --enable-ldap --enable-authnz-ldap \
         --enable-cgid --enable-cgi \
         --enable-cgid-fdpassing \
         --enable-authn-anon --enable-authn-alias \
