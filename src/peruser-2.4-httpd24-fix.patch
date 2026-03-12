@@ -615,7 +615,7 @@
 +# define _DBG(text,par...) \
 +    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, \
 +                 "(peruser: pid=%d uid=%d child=%d) %s(): " text, \
-+                 getpid(), getuid(), my_child_num, __FUNCTION__, ##par, 0)
++                 getpid(), getuid(), my_child_num, __FUNCTION__, ##par)
 +
 +# define _TRACE_CALL(text,par...) _DBG("calling " text, ##par)
 +# define _TRACE_RET(text,par...) _DBG("returned from " text, ##par)
@@ -3092,11 +3092,6 @@
 +#ifdef _OSD_POSIX
 +    /* BS2000 requires a "special" version of fork() before a setuid() call */
 +    if ((pid = os_fork(ap_unixd_config.user_name)) == -1) {
-+#elif defined(TPF)
-+        if ((pid = os_fork(s, slot)) == -1) {
-+#else
-+    if ((pid = fork()) == -1) {
-+#endif
 +        ap_log_error(APLOG_MARK, APLOG_ERR, errno, s,
 +                     "fork: Unable to fork new process");
 +
@@ -3113,6 +3108,43 @@
 +
 +        return -1;
 +    }
++#elif defined(TPF)
++    if ((pid = os_fork(s, slot)) == -1) {
++        ap_log_error(APLOG_MARK, APLOG_ERR, errno, s,
++                     "fork: Unable to fork new process");
++
++        /* fork didn't succeed. Fix the scoreboard or else
++         * it will say SERVER_STARTING forever and ever
++         */
++        (void) ap_update_child_status_from_indexes(slot, 0, SERVER_DEAD,
++                                                   (request_rec *) NULL);
++
++        /* In case system resources are maxxed out, we don't want
++         Apache running away with the CPU trying to fork over and
++         over and over again. */
++        apr_sleep(apr_time_from_sec(10));
++
++        return -1;
++    }
++#else
++    if ((pid = fork()) == -1) {
++        ap_log_error(APLOG_MARK, APLOG_ERR, errno, s,
++                     "fork: Unable to fork new process");
++
++        /* fork didn't succeed. Fix the scoreboard or else
++         * it will say SERVER_STARTING forever and ever
++         */
++        (void) ap_update_child_status_from_indexes(slot, 0, SERVER_DEAD,
++                                                   (request_rec *) NULL);
++
++        /* In case system resources are maxxed out, we don't want
++         Apache running away with the CPU trying to fork over and
++         over and over again. */
++        apr_sleep(apr_time_from_sec(10));
++
++        return -1;
++    }
++#endif
 +
 +    if (!pid) {
 +#ifdef HAVE_BINDPROCESSOR
