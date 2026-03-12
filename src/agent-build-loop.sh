@@ -90,6 +90,13 @@ echo ""
 echo "--- Running RPM build ---"
 echo ""
 
+# Verify the in-container build script is present in src/ before running
+if [ ! -f "${SCRIPT_DIR}/build-rpm-dev.sh" ]; then
+    echo "=== BUILD FAILED ==="
+    echo "ERROR: src/build-rpm-dev.sh not found at ${SCRIPT_DIR}/build-rpm-dev.sh"
+    exit 1
+fi
+
 # Capture build output and stream it live at the same time
 BUILD_LOG=$(mktemp /tmp/agent-build-XXXXXX.log)
 trap 'rm -f "${BUILD_LOG}"; docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true' EXIT
@@ -121,11 +128,13 @@ if [ "${BUILD_EXIT}" -eq 0 ]; then
 else
     echo "=== BUILD FAILED ==="
     echo ""
+    # Pattern that matches patch application failures
+    PATCH_PATTERN="patch: \*\*\*\|Hunk #\|FAILED -- saving\|can't find file\|patching file"
     # Highlight patch errors specifically
-    if grep -q "patch: \*\*\*\|Hunk #\|FAILED -- saving\|can't find file\|patching file" "${BUILD_LOG}" 2>/dev/null; then
+    if grep -q "${PATCH_PATTERN}" "${BUILD_LOG}" 2>/dev/null; then
         echo "=== PATCH ERROR ==="
         echo "The patch failed to apply. Relevant lines:"
-        grep -n "patch: \*\*\*\|Hunk #\|FAILED -- saving\|can't find file\|patching file\|offset\|fuzz" "${BUILD_LOG}" 2>/dev/null || true
+        grep -n "${PATCH_PATTERN}\|offset\|fuzz" "${BUILD_LOG}" 2>/dev/null || true
         echo ""
         echo "HOW TO FIX:"
         echo "  1. Look at which hunk(s) failed above."

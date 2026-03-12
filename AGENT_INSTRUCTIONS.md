@@ -94,12 +94,12 @@ line number. No action required unless the build later fails.
 
 ### 2. `ap_reclaim_child_processes` signature change
 
-Apache 2.4.43+ changed the signature:
+Apache 2.4.43 changed the signature (current target 2.4.62 uses the new form):
 ```c
-// Old (pre-2.4.43):
+// Old (pre-2.4.43, for reference only — not applicable to 2.4.62):
 ap_reclaim_child_processes(int terminate);
 
-// New (2.4.43+):
+// New (2.4.43+, required for httpd 2.4.62):
 ap_reclaim_child_processes(int terminate, ap_mpm_run_maint_fn callback);
 ```
 
