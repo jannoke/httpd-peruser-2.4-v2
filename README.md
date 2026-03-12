@@ -9,7 +9,9 @@ user, improving isolation and security in shared-hosting scenarios.
 
 ```
 .
+├── .devcontainer/devcontainer.json   # GitHub Codespaces configuration
 ├── .github/workflows/build-rpm.yml   # Full CI/CD pipeline (GitHub Actions)
+├── AGENT_INSTRUCTIONS.md             # Instructions for the coding agent
 ├── src/                              # All source files, patches, and build scripts
 │   ├── httpd.spec                    # RPM spec file
 │   ├── peruser-2.4-httpd24-fix.patch # Main peruser MPM patch
@@ -18,7 +20,8 @@ user, improving isolation and security in shared-hosting scenarios.
 │   ├── build-rpm.sh                  # One-shot Docker build script
 │   ├── Dockerfile.devbuild           # Development build image (Rocky Linux 9)
 │   ├── build-rpm-dev.sh              # In-container build script (dev loop)
-│   └── dev-build-loop.sh             # Interactive dev build loop (see below)
+│   ├── dev-build-loop.sh             # Interactive dev build loop (see below)
+│   └── agent-build-loop.sh           # Non-interactive build script (agent use)
 └── README.md                         # This file
 ```
 
@@ -113,6 +116,41 @@ git push
 - Build artifacts (SRPM and RPM) are copied to `src/output/` on success.
   The `src/output/` directory is listed in `.gitignore` and will not be
   committed.
+
+---
+
+## Agent-Driven Compile Loop (Codespaces)
+
+If you use the **Copilot coding agent** to fix the peruser patch, you can ask
+it to iterate autonomously until the build succeeds — no more saying "fix it
+again" repeatedly.
+
+### How it works
+
+1. The agent opens the repository in a **GitHub Codespace** (which has Docker
+   support via the included `.devcontainer/devcontainer.json`).
+2. It runs `./src/agent-build-loop.sh` — a non-interactive build script that:
+   - Runs the full RPM build in a Rocky Linux 9 Docker container
+   - Exits `0` on success, non-zero on failure
+   - Outputs clear markers (`=== BUILD SUCCEEDED ===`, `=== BUILD FAILED ===`,
+     `=== PATCH ERROR ===`, `=== COMPILE ERROR ===`)
+3. If the build fails, the agent reads the error, edits
+   `src/peruser-2.4-httpd24-fix.patch`, and runs the script again.
+4. Once the build succeeds, the agent commits and updates the PR.
+
+### Prompt to give the agent
+
+> "Fix the peruser-2.4-httpd24-fix.patch until it compiles successfully.
+> Follow the instructions in AGENT_INSTRUCTIONS.md.
+> Run ./src/agent-build-loop.sh to test each fix.
+> Keep iterating until the build succeeds, then commit."
+
+The agent will autonomously loop through fix → build → check → fix until done.
+
+### Prerequisites
+
+- A GitHub Codespace for this repository (Docker-in-Docker is pre-configured)
+- Or any machine with Docker installed (the script works the same way)
 
 ---
 

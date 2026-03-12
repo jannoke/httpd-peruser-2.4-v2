@@ -1,0 +1,9 @@
+{
+  "name": "httpd-peruser-dev",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "postCreateCommand": "echo 'Codespace ready for agent build loop'",
+  "remoteUser": "vscode"
+}
