@@ -526,7 +526,7 @@
 +
 +/* Peruser version 0.4.0 */
 +
-+#define MPM_PERUSER_DEBUG
++/* #define MPM_PERUSER_DEBUG */
 +/* #define PERUSER_MAX_CPU_USAGE */
 +/* #define PERUSER_PAM_SESSION */
 +
@@ -2601,6 +2601,7 @@
 +        /* -- create new listener to receive from workers -- */
 +        apr_os_sock_put(&sock, &CHILD_INFO_TABLE[my_child_num].senv->input,
 +                        pconf);
++        listen_clear();
 +        listen_add(pconf, sock, receive_connection);
 +        break;
 +
