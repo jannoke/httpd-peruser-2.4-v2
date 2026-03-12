@@ -1,0 +1,42 @@
+# Dockerfile for the local development build environment
+# Uses Rocky Linux 9 to match the GitHub Actions CI environment
+# The src/ directory is mounted at /src for live editing
+FROM rockylinux:9
+
+# Enable the CodeReady Builder (CRB) repository for additional build dependencies
+RUN dnf install -y dnf-plugins-core && \
+    dnf config-manager --set-enabled crb
+
+# Install all build dependencies matching the CI workflow
+RUN dnf install -y \
+        rpm-build \
+        rpmdevtools \
+        gcc \
+        autoconf \
+        pkgconfig \
+        findutils \
+        xmlto \
+        perl-interpreter \
+        perl-generators \
+        systemd-devel \
+        zlib-devel \
+        libselinux-devel \
+        lua-devel \
+        brotli-devel \
+        apr-devel \
+        apr-util-devel \
+        pcre-devel \
+        gnupg2 \
+        systemd-rpm-macros \
+        openssl-devel \
+        libtool \
+        which \
+        make \
+        libxml2-devel \
+    && dnf clean all
+
+# Set up the rpmbuild directory tree
+RUN rpmdev-setuptree
+
+# Keep the container running so the dev-build-loop can exec into it repeatedly
+CMD ["tail", "-f", "/dev/null"]
