@@ -465,7 +465,7 @@
 +#endif /* AP_MPM_DEFAULT_H */
 --- a/server/mpm/peruser/peruser.c
 +++ b/server/mpm/peruser/peruser.c
-@@ -0,0 +1,4669 @@
+@@ -0,0 +1,4686 @@
 +/* ====================================================================
 + * The Apache Software License, Version 1.1
 + *
