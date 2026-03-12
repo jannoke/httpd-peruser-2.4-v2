@@ -541,19 +541,32 @@ jobs:
           pgrep -x httpd 2>/dev/null && pkill -9 -x httpd 2>/dev/null || true
 
       - name: Analyze core dump with gdb
-        if: |
-          failure() && (
-            steps.httpd_start.outputs.httpd_crashed == 'true' ||
-            steps.http_test.outputs.segfault_detected == 'true' ||
-            steps.verify_processes.outputs.segfault_detected == 'true' ||
-            steps.check_segfaults.outputs.segfault_detected == 'true'
-          )
+        if: failure()
         run: |
           echo "=== Core Dump Analysis ==="
           echo "Current core_pattern: $(cat /proc/sys/kernel/core_pattern)"
 
-          CORE=""
           HTTPD_BIN=$(which httpd 2>/dev/null || echo "/usr/sbin/httpd")
+
+          cat > /tmp/gdb-commands.txt << 'GDBEOF'
+          set pagination off
+          bt full
+          info threads
+          thread apply all bt full
+          info registers
+          info sharedlibrary
+          GDBEOF
+
+          run_gdb() {
+            local CORE="$1"
+            local LABEL="$2"
+            echo ""
+            echo "=== Analyzing $LABEL: $CORE ==="
+            gdb --batch \
+              -x /tmp/gdb-commands.txt \
+              "$HTTPD_BIN" "$CORE" \
+              2>&1 | tee -a /tmp/backtrace.txt
+          }
 
           # Try coredumpctl first (handles systemd-coredump-managed cores)
           if command -v coredumpctl &>/dev/null; then
@@ -564,8 +577,7 @@ jobs:
             if coredumpctl info httpd 2>&1 | tee /tmp/coredump-info.txt; then
               echo "Extracting httpd core dump via coredumpctl..."
               if coredumpctl dump httpd -o /tmp/core.httpd 2>/tmp/coredumpctl-dump.err; then
-                CORE=/tmp/core.httpd
-                echo "Core extracted to: $CORE"
+                run_gdb /tmp/core.httpd "coredumpctl core"
               else
                 echo "coredumpctl dump failed:"
                 cat /tmp/coredumpctl-dump.err || true
@@ -577,44 +589,29 @@ jobs:
             echo "coredumpctl not available"
           fi
 
-          # Fall back to searching common locations
-          if [ -z "$CORE" ]; then
-            echo "=== Searching for core files in /tmp/coredumps and /tmp ==="
-            CORE=$(find /tmp/coredumps /tmp \( -name "core.*" -o -name "core" \) 2>/dev/null | head -n 1)
-            if [ -n "$CORE" ]; then
-              echo "Found core dump: $CORE"
-            fi
+          # Search common locations and analyze up to 2 core files
+          echo "=== Searching for core files in /tmp/coredumps and /tmp ==="
+          CORES=$(find /tmp/coredumps /tmp \( -name "core.*" -o -name "core" \) 2>/dev/null | head -n 2)
+          if [ -n "$CORES" ]; then
+            echo "Found core dumps:"
+            echo "$CORES"
+            N=1
+            while IFS= read -r CORE; do
+              run_gdb "$CORE" "core #$N"
+              N=$((N + 1))
+            done <<< "$CORES"
+          else
+            echo "No core files found in /tmp/coredumps or /tmp"
+            echo "  core_pattern in effect: $(cat /proc/sys/kernel/core_pattern)"
           fi
 
-          if [ -z "$CORE" ]; then
-            echo "No core dump found via coredumpctl or in /tmp/coredumps or /tmp"
-            echo "Possible reasons:"
-            echo "  - core_pattern setting in this container: $(cat /proc/sys/kernel/core_pattern)"
-            echo "  - Core dumps are being captured by the host system's coredump handler"
-            echo "  - systemd-coredump journal may not be accessible from inside the container"
-            exit 0
+          if [ -f /tmp/backtrace.txt ]; then
+            echo ""
+            echo "=== GDB Backtrace Summary ==="
+            cat /tmp/backtrace.txt
+          else
+            echo "No backtraces were produced"
           fi
-
-          echo "Analyzing core dump: $CORE"
-          echo "httpd binary: $HTTPD_BIN"
-
-          cat > /tmp/gdb-commands.txt << 'GDBEOF'
-          set pagination off
-          bt full
-          info threads
-          thread apply all bt full
-          info registers
-          info sharedlibrary
-          GDBEOF
-
-          echo "=== Running gdb on core dump ==="
-          gdb --batch \
-            -x /tmp/gdb-commands.txt \
-            "$HTTPD_BIN" "$CORE" \
-            2>&1 | tee /tmp/backtrace.txt
-
-          echo "=== GDB Backtrace Summary ==="
-          cat /tmp/backtrace.txt
 
       - name: Collect debug artifacts
         if: always()
