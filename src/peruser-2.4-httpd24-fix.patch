@@ -615,7 +615,7 @@
 +# define _DBG(text,par...) \
 +    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, NULL, \
 +                 "(peruser: pid=%d uid=%d child=%d) %s(): " text, \
-+                 getpid(), getuid(), my_child_num, __FUNCTION__, ##par, 0)
++                 getpid(), getuid(), my_child_num, __FUNCTION__, ##par)
 +
 +# define _TRACE_CALL(text,par...) _DBG("calling " text, ##par)
 +# define _TRACE_RET(text,par...) _DBG("returned from " text, ##par)
@@ -1690,7 +1690,7 @@
 +        return -1;
 +    }
 +
-+    _DBG("passing request to another child.", 0);
++    _DBG("passing request to another child.");
 +
 +    apr_os_sock_get(&sock_fd, thesock);
 +
@@ -1762,7 +1762,7 @@
 +    peruser_server_conf *sconf;
 +    int ssl_on = 0;
 +
-+    _DBG("Creating dummy connection to use the vhost lookup api", 0);
++    _DBG("Creating dummy connection to use the vhost lookup api");
 +
 +    ap_create_sb_handle(&sbh, p, conn_id, 0);
 +    current_conn = ap_run_create_connection(p, ap_server_conf, sock, conn_id,
@@ -1793,10 +1793,10 @@
 +
 +            activate_child(processor);
 +
-+            _DBG("Creating new pool",0);
++            _DBG("Creating new pool");
 +            apr_pool_create(&ptrans, pool);
 +
-+            _DBG("Passing request.",0);
++            _DBG("Passing request.");
 +            if (pass_socket(sock, processor, ptrans) == -1) {
 +                if (processor->senv) {
 +                    if (processor->senv->error_pass == 0) {
@@ -1825,11 +1825,11 @@
 +        }
 +
 +        if (current_conn) {
-+            _DBG("freeing connection", 0);
++            _DBG("freeing connection");
 +            ap_lingering_close(current_conn);
 +        }
 +
-+        _DBG("doing longjmp", 0);
++        _DBG("doing longjmp");
 +        longjmp(CHILD_INFO_TABLE[my_child_num].jmpbuffer, 1);
 +        return;
 +    }
@@ -1879,7 +1879,7 @@
 +    apr_bucket_brigade *bb;
 +    core_net_rec *net;
 +
-+    _DBG("function entered", 0);
++    _DBG("function entered");
 +
 +    /* -- fetch our sockets from the pool -- */
 +    apr_pool_userdata_get((void **) &bb, "PERUSER_SOCKETS", conn->pool);
@@ -1960,7 +1960,7 @@
 +                   APR_NONBLOCK_READ, len);
 +
 +    /* Scan the brigade looking for heap-buckets */
-+    _DBG("Scanning the brigade",0);
++    _DBG("Scanning the brigade");
 +    bucket = APR_BRIGADE_FIRST(bb);
 +
 +    while (bucket != APR_BRIGADE_SENTINEL(bb) && APR_BUCKET_IS_HEAP(bucket)) {
@@ -2165,7 +2165,7 @@
 +    _DBG("header_len=%d headers=\"%s\"", header_len, headers);
 +
 +    if (header_len) {
-+        _DBG("header_len > 0, we got a request", 0);
++        _DBG("header_len > 0, we got a request");
 +        /* -- store received data into an brigade and add
 +         it to the current transaction's pool -- */
 +        bucket = apr_bucket_eos_create(alloc);
@@ -2181,7 +2181,7 @@
 +            APR_BRIGADE_INSERT_HEAD(bb, bucket);
 +        }
 +        else {
-+            _DBG("There is no body",0);
++            _DBG("There is no body");
 +        }
 +
 +        bucket = apr_bucket_heap_create(headers, header_len, NULL, alloc);
@@ -2190,7 +2190,7 @@
 +        apr_pool_userdata_set(bb, "PERUSER_SOCKETS", NULL, ptrans);
 +    }
 +    else {
-+        _DBG("header_len == 0, we got a socket only", 0);
++        _DBG("header_len == 0, we got a socket only");
 +    }
 +
 +    return 0;
@@ -2451,7 +2451,7 @@
 +{
 +    ap_listen_rec *lr_walk, *lr_new;
 +
-+    _DBG("function entered", 0);
++    _DBG("function entered");
 +
 +    /* -- create an new listener for this child -- */
 +    lr_new = apr_palloc(pool, sizeof(*lr_new));
@@ -2484,7 +2484,7 @@
 +{
 +    ap_listen_rec *lr_walk;
 +
-+    _DBG("function entered", 0);
++    _DBG("function entered");
 +
 +    /* FIXME: should we somehow lock this list ? */
 +    while (ap_listeners) {
@@ -2675,7 +2675,7 @@
 +        if (CHILD_INFO_TABLE[my_child_num].type != CHILD_TYPE_MULTIPLEXER
 +            && ap_max_requests_per_child > 0
 +            && requests_this_child++ >= ap_max_requests_per_child) {
-+            _DBG("max requests reached, dying now", 0);
++            _DBG("max requests reached, dying now");
 +#ifdef PERUSER_MAX_CPU_USAGE
 +            CHILD_INFO_TABLE[my_child_num].cpu_stopped = 0;
 +#endif
@@ -2748,7 +2748,7 @@
 +
 +        got_fd:
 +
-+        _DBG("input available ... resetting socket.",0);
++        _DBG("input available ... resetting socket.");
 +        sock = NULL; /* important! */
 +
 +        /* if we accept() something we don't want to die, so we have to
@@ -2812,18 +2812,18 @@
 +        }
 +
 +        if (!setjmp(CHILD_INFO_TABLE[my_child_num].jmpbuffer)) {
-+            _DBG("marked jmpbuffer",0);
++            _DBG("marked jmpbuffer");
 +
 +            CHILD_INFO_TABLE[my_child_num].senv->stats_connections++;
 +
-+            _TRACE_CALL("process_socket()",0);
++            _TRACE_CALL("process_socket()");
 +
 +            process_socket(ptrans, sock, my_child_num, bucket_alloc, pchild);
 +
-+            _TRACE_RET("process_socket()",0);
++            _TRACE_RET("process_socket()");
 +        }
 +        else {
-+            _DBG("landed from longjmp",0);
++            _DBG("landed from longjmp");
 +            CHILD_INFO_TABLE[my_child_num].sock_fd = AP_PERUSER_THISCHILD;
 +        }
 +
@@ -2833,7 +2833,7 @@
 +         * idle server process that gets to die.
 +         */
 +        if (ap_mpm_pod_check(pod) == APR_SUCCESS) { /* selected as idle? */
-+            _DBG("ap_mpm_pod_check(pod) = APR_SUCCESS; dying now", 0);
++            _DBG("ap_mpm_pod_check(pod) = APR_SUCCESS; dying now");
 +            die_now = 1;
 +        }
 +        else if (ap_my_generation
@@ -2847,7 +2847,7 @@
 +        }
 +
 +        if (CHILD_INFO_TABLE[my_child_num].status == CHILD_STATUS_RESTART) {
-+            _DBG("restarting", 0);
++            _DBG("restarting");
 +            die_now = 1;
 +        }
 +    }
@@ -3042,7 +3042,7 @@
 +         senv->gid, type, senv->chroot);
 +
 +    if (senv->uid == 0 || senv->gid == 0) {
-+        _DBG("Assigning root user/group to a child.", 0);
++        _DBG("Assigning root user/group to a child.");
 +    }
 +
 +    if (i >= NUM_CHILDS) {
@@ -3092,11 +3092,6 @@
 +#ifdef _OSD_POSIX
 +    /* BS2000 requires a "special" version of fork() before a setuid() call */
 +    if ((pid = os_fork(ap_unixd_config.user_name)) == -1) {
-+#elif defined(TPF)
-+        if ((pid = os_fork(s, slot)) == -1) {
-+#else
-+    if ((pid = fork()) == -1) {
-+#endif
 +        ap_log_error(APLOG_MARK, APLOG_ERR, errno, s,
 +                     "fork: Unable to fork new process");
 +
@@ -3113,6 +3108,43 @@
 +
 +        return -1;
 +    }
++#elif defined(TPF)
++    if ((pid = os_fork(s, slot)) == -1) {
++        ap_log_error(APLOG_MARK, APLOG_ERR, errno, s,
++                     "fork: Unable to fork new process");
++
++        /* fork didn't succeed. Fix the scoreboard or else
++         * it will say SERVER_STARTING forever and ever
++         */
++        (void) ap_update_child_status_from_indexes(slot, 0, SERVER_DEAD,
++                                                   (request_rec *) NULL);
++
++        /* In case system resources are maxxed out, we don't want
++         Apache running away with the CPU trying to fork over and
++         over and over again. */
++        apr_sleep(apr_time_from_sec(10));
++
++        return -1;
++    }
++#else
++    if ((pid = fork()) == -1) {
++        ap_log_error(APLOG_MARK, APLOG_ERR, errno, s,
++                     "fork: Unable to fork new process");
++
++        /* fork didn't succeed. Fix the scoreboard or else
++         * it will say SERVER_STARTING forever and ever
++         */
++        (void) ap_update_child_status_from_indexes(slot, 0, SERVER_DEAD,
++                                                   (request_rec *) NULL);
++
++        /* In case system resources are maxxed out, we don't want
++         Apache running away with the CPU trying to fork over and
++         over and over again. */
++        apr_sleep(apr_time_from_sec(10));
++
++        return -1;
++    }
++#endif
 +
 +    if (!pid) {
 +#ifdef HAVE_BINDPROCESSOR
@@ -3553,20 +3585,20 @@
 +
 +                status = ap_scoreboard_image->servers[child_slot][0].status;
 +
-+                _TRACE_CALL("ap_update_child_status_from_indexes", 0);
++                _TRACE_CALL("ap_update_child_status_from_indexes");
 +
 +                (void)ap_update_child_status_from_indexes(child_slot, 0,
 +                                                          SERVER_DEAD,
 +                                                          (request_rec *)NULL);
 +
-+                _TRACE_RET("ap_update_child_status_from_indexes", 0);
++                _TRACE_RET("ap_update_child_status_from_indexes");
 +
 +                if (processed_status == APEXIT_CHILDSICK) {
 +                    /* child detected a resource shortage (E[NM]FILE, ENOBUFS,
 +                     * etc)
 +                     * cut the fork rate to the minimum 
 +                     */
-+                    _DBG("processed_status = APEXIT_CHILDSICK", 0);
++                    _DBG("processed_status = APEXIT_CHILDSICK");
 +                    idle_spawn_rate = 1;
 +                }
 +                else if (status == SERVER_GRACEFUL) {
@@ -3577,7 +3609,7 @@
 +                else if (CHILD_INFO_TABLE[child_slot].status
 +                        == CHILD_STATUS_STANDBY)
 +                {
-+                    _DBG("leaving child in standby state", 0);
++                    _DBG("leaving child in standby state");
 +
 +                    if (CHILD_INFO_TABLE[child_slot].type == CHILD_TYPE_WORKER
 +                        || CHILD_INFO_TABLE[child_slot].type == CHILD_TYPE_MULTIPLEXER) {
@@ -3594,14 +3626,14 @@
 +                    /* we're still doing a 1-for-1 replacement of dead
 +                     * children with new children
 +                     */
-+                    _DBG("replacing by new child ...", 0);
++                    _DBG("replacing by new child ...");
 +                    make_child(ap_server_conf, child_slot);
 +                }
 +#if APR_HAS_OTHER_CHILD
 +            }
 +            else if (apr_proc_other_child_alert(&pid, APR_OC_REASON_DEATH,
 +                                                status) == APR_SUCCESS) {
-+                _DBG("Already handled", 0);
++                _DBG("Already handled");
 +                /* handled */
 +#endif
 +            }
@@ -3610,7 +3642,7 @@
 +                 * scoreboard.  Somehow we don't know about this
 +                 * child.
 +                 */
-+                _DBG("long lost child came home, whatever that means", 0);
++                _DBG("long lost child came home, whatever that means");
 +
 +                ap_log_error(APLOG_MARK, APLOG_WARNING, 0, ap_server_conf,
 +                             "long lost child came home! (pid %ld)",
@@ -3919,7 +3951,7 @@
 +    }
 +
 +    if (!child_info_image) {
-+        _DBG("Initializing child_info_table", 0);
++        _DBG("Initializing child_info_table");
 +        child_info_size = tmp_server_limit * sizeof(child_info_t)
 +                          + sizeof(apr_size_t);
 +
@@ -3928,19 +3960,19 @@
 +
 +        /*  if ((rv != APR_SUCCESS) && (rv != APR_ENOTIMPL)) { */
 +        if (rv != APR_SUCCESS) {
-+            _DBG("shared memory creation failed", 0);
++            _DBG("shared memory creation failed");
 +
 +            ap_log_error(APLOG_MARK, APLOG_CRIT, rv, NULL,
 +                         "Unable to create shared memory segment "
 +                         "(anonymous shared memory failure)");
 +        }
 +        else if (rv == APR_ENOTIMPL) {
-+            _DBG("anonymous shared memory not available", 0);
++            _DBG("anonymous shared memory not available");
 +            /* TODO: make up a filename and do name-based shmem */
 +        }
 +
 +        if (rv || !(shmem = apr_shm_baseaddr_get(child_info_shm))) {
-+            _DBG("apr_shm_baseaddr_get() failed", 0);
++            _DBG("apr_shm_baseaddr_get() failed");
 +            return HTTP_INTERNAL_SERVER_ERROR;
 +        }
 +
@@ -3966,7 +3998,7 @@
 +    }
 +
 +    if (!server_env_image) {
-+        _DBG("Initializing server_environments_table", 0);
++        _DBG("Initializing server_environments_table");
 +
 +        server_env_size = tmp_server_limit * sizeof(server_env_t)
 +                          + sizeof(apr_size_t);
@@ -3975,19 +4007,19 @@
 +                            global_pool);
 +
 +        if (rv != APR_SUCCESS) {
-+            _DBG("shared memory creation failed", 0);
++            _DBG("shared memory creation failed");
 +
 +            ap_log_error(APLOG_MARK, APLOG_CRIT, rv, NULL,
 +                         "Unable to create shared memory segment "
 +                         "(anonymous shared memory failure)");
 +        }
 +        else if (rv == APR_ENOTIMPL) {
-+            _DBG("anonymous shared memory not available", 0);
++            _DBG("anonymous shared memory not available");
 +            /* TODO: make up a filename and do name-based shmem */
 +        }
 +
 +        if (rv || !(shmem = apr_shm_baseaddr_get(server_env_shm))) {
-+            _DBG("apr_shm_baseaddr_get() failed", 0);
++            _DBG("apr_shm_baseaddr_get() failed");
 +            return HTTP_INTERNAL_SERVER_ERROR;
 +        }
 +
@@ -4114,7 +4146,7 @@
 +    }
 +
 +    if (!strlen(r->the_request)) {
-+        _DBG("corrupt request. aborting",0);
++        _DBG("corrupt request. aborting");
 +        return DECLINED;
 +    }
 +
@@ -4124,7 +4156,7 @@
 +        apr_os_sock_put(&sock, &processor->sock_fd, r->connection->pool);
 +        ap_sock_disable_nagle(sock);
 +        ap_set_module_config(r->connection->conn_config, &core_module, sock);
-+        _DBG("not the right socket?", 0);
++        _DBG("not the right socket?");
 +        return OK;
 +    }
 +
@@ -4154,7 +4186,7 @@
 +
 +            }
 +
-+            _DBG("Passing request.",0);
++            _DBG("Passing request.");
 +            retval = pass_request(r, processor);
 +            if (retval == -1) {
 +                if (processor->senv) {
@@ -4179,11 +4211,11 @@
 +                processor->senv->error_pass = 0;
 +            }
 +
-+            _DBG("doing longjmp",0);
++            _DBG("doing longjmp");
 +
 +            longjmp(CHILD_INFO_TABLE[my_child_num].jmpbuffer, 1);
 +
-+            _DBG("request declined at our site",0);
++            _DBG("request declined at our site");
 +
 +            return DECLINED;
 +        }
@@ -4250,7 +4282,7 @@
 +    }
 +    }
 +
-+    _DBG("THIS POINT SHOULD NOT BE REACHED!",0);
++    _DBG("THIS POINT SHOULD NOT BE REACHED!");
 +
 +    return OK;
 +}
@@ -4660,7 +4692,7 @@
 +    server_env_t senv;
 +    char * processor_name, *tmp;
 +
-+    _DBG("function entered", 0);
++    _DBG("function entered");
 +
 +    /* name of processor env */
 +    processor_name = name;
