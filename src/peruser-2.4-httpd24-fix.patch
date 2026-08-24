@@ -465,7 +465,7 @@
 +#endif /* AP_MPM_DEFAULT_H */
 --- a/server/mpm/peruser/peruser.c
 +++ b/server/mpm/peruser/peruser.c
-@@ -0,0 +1,4737 @@
+@@ -0,0 +1,4750 @@
 +/* ====================================================================
 + * The Apache Software License, Version 1.1
 + *
@@ -2649,6 +2649,19 @@
 +    listensocks = apr_pcalloc(pchild, sizeof(*listensocks) * (num_listensocks));
 +
 +    for (lr = ap_listeners, i = 0; i < num_listensocks; lr = lr->next, i++) {
++        /* Real network listener(s) inherited via ap_listeners never get an
++         * accept_func assigned by anything in this file -- listen_add()
++         * only sets it on the private fd-passing sockets it creates
++         * itself (receive_connection / check_pipe_of_death). Every other
++         * MPM (prefork/worker/event) explicitly wires
++         * lr->accept_func = ap_unixd_accept for its real listeners at this
++         * same point; peruser.c never did, so the real listener's
++         * accept_func was always NULL here, causing child_main() to hit
++         * its own "accept_func is NULL" guard and fatal out the instant a
++         * real client connection actually arrived on it. */
++        if (lr->accept_func == NULL) {
++            lr->accept_func = ap_unixd_accept;
++        }
 +        listensocks[i].accept_func = lr->accept_func;
 +        listensocks[i].sd = lr->sd;
 +        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, NULL,
