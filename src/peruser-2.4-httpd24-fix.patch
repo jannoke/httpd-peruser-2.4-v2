@@ -465,7 +465,7 @@
 +#endif /* AP_MPM_DEFAULT_H */
 --- a/server/mpm/peruser/peruser.c
 +++ b/server/mpm/peruser/peruser.c
-@@ -0,0 +1,4731 @@
+@@ -0,0 +1,4737 @@
 +/* ====================================================================
 + * The Apache Software License, Version 1.1
 + *
@@ -2598,10 +2598,16 @@
 +    case CHILD_TYPE_MULTIPLEXER:
 +        _DBG("MULTIPLEXER %d", my_child_num);
 +
-+        /* -- create new listener to receive from workers -- */
++        /* -- add the private fd-passing channel used to receive
++         * already-accepted connections back from workers, IN ADDITION
++         * to (not instead of) the real network listener(s) inherited
++         * from the parent via ap_listeners. Unlike PROCESSOR/WORKER,
++         * the multiplexer must keep accepting real client connections
++         * on the real "Listen" socket(s); calling listen_clear() here
++         * discards them, so the multiplexer stops answering client
++         * requests entirely (no crash, just silent non-response). -- */
 +        apr_os_sock_put(&sock, &CHILD_INFO_TABLE[my_child_num].senv->input,
 +                        pconf);
-+        listen_clear();
 +        listen_add(pconf, sock, receive_connection);
 +        break;
 +
@@ -5197,4 +5203,3 @@
 +    peruser_cmds,           /* command apr_table_t */
 +    peruser_hooks,          /* register hooks */
 +};
-
