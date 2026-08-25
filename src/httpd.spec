@@ -115,7 +115,7 @@ License:              ASL 2.0
 BuildRequires:        gcc, autoconf, pkgconfig, findutils, xmlto
 BuildRequires:        perl-interpreter, perl-generators, systemd-devel
 BuildRequires:        zlib-devel, libselinux-devel, lua-devel, brotli-devel
-BuildRequires:        apr-devel >= 1.5.0, apr-util-devel >= 1.5.0, pcre-devel >= 5.0
+BuildRequires:        apr-devel >= 1.5.0, apr-util-devel >= 1.5.0, pcre2-devel
 BuildRequires:        gnupg2
 BuildRequires:        systemd-rpm-macros
 Requires:             system-logos-httpd
@@ -365,7 +365,7 @@ export LYNX_PATH=/usr/bin/links
         --with-suexec-uidmin=1000 --with-suexec-gidmin=1000 \
         --with-brotli \
         --enable-pie \
-        --with-pcre=/usr/bin/pcre-config \
+        --with-pcre=/usr/bin/pcre2-config \
         --enable-mods-shared=all \
         --enable-ssl --disable-distcache \
         --enable-proxy --enable-proxy-fdpass \
