@@ -12,9 +12,11 @@
 #     the exact syscalls (fork/setuid/socket/accept) leading up to a fault
 #
 # Usage (run from repo root or from src/):
-#   ./src/local-smoke-test.sh [--cycles N] [--multi-tenant]
+#   ./src/local-smoke-test.sh [--cycles N] [--multi-tenant]         # el9
+#   EL_VERSION=10 ./src/local-smoke-test.sh [--cycles N]            # el10
 #
-# Requires: src/output/RPMS/**/*.rpm already built (run agent-build-loop.sh first)
+# Requires: src/output/el${EL_VERSION}/RPMS/**/*.rpm already built
+# (run agent-build-loop.sh / dev-build-loop.sh first, with the same EL_VERSION)
 #
 # Exit codes:
 #   0 - all cycles passed
@@ -23,12 +25,26 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-IMAGE_NAME="rockylinux:9"
-CONTAINER_NAME="httpd-peruser-smoke-test"
+EL_VERSION="${EL_VERSION:-9}"
+case "$EL_VERSION" in
+  9)
+    IMAGE_NAME="rockylinux:9"
+    ;;
+  10)
+    # el10 is not published under the plain `rockylinux` Docker Hub
+    # namespace the way 8/9 are.
+    IMAGE_NAME="rockylinux/rockylinux:10"
+    ;;
+  *)
+    echo "ERROR: unsupported EL_VERSION '${EL_VERSION}' (expected 9 or 10)"
+    exit 1
+    ;;
+esac
+CONTAINER_NAME="httpd-peruser-smoke-test-el${EL_VERSION}"
 
 if [ "${1:-}" = "--in-container" ]; then
   # ---------------------------------------------------------------------
-  # Runs inside the Rocky Linux 9 container. Everything below this line
+  # Runs inside the Rocky Linux container. Everything below this line
   # is the actual test; the host-side dispatch is at the bottom of the file.
   # ---------------------------------------------------------------------
   set -o pipefail
@@ -46,14 +62,16 @@ if [ "${1:-}" = "--in-container" ]; then
   dnf clean all >/dev/null
 
   echo "--- Installing built peruser httpd RPMs ---"
-  RPMS=$(find /src/output/RPMS -name "httpd-*.rpm" | grep -vE 'debuginfo|debugsource|\.src\.rpm' | sort)
+  EL_VERSION="${EL_VERSION:-9}"
+  RPMS_DIR="/src/output/el${EL_VERSION}/RPMS"
+  RPMS=$(find "$RPMS_DIR" -name "httpd-*.rpm" | grep -vE 'debuginfo|debugsource|\.src\.rpm' | sort)
   if [ -z "$RPMS" ]; then
-    echo "ERROR: no built RPMs found under /src/output/RPMS — run agent-build-loop.sh first."
+    echo "ERROR: no built RPMs found under ${RPMS_DIR} — run agent-build-loop.sh (EL_VERSION=${EL_VERSION}) first."
     exit 1
   fi
   printf 'Installing:\n%s\n' "$RPMS"
   dnf install -y --allowerasing --setopt=install_weak_deps=False $RPMS
-  DEBUGINFO_RPMS=$(find /src/output/RPMS -name "httpd-debuginfo-*.rpm" 2>/dev/null | sort)
+  DEBUGINFO_RPMS=$(find "$RPMS_DIR" -name "httpd-debuginfo-*.rpm" 2>/dev/null | sort)
   if [ -n "$DEBUGINFO_RPMS" ]; then
     dnf install -y --allowerasing $DEBUGINFO_RPMS || echo "Warning: debuginfo installation failed"
   fi
@@ -309,7 +327,7 @@ GDBEOF
 fi
 
 # ---------------------------------------------------------------------------
-# Host-side dispatch: run the block above inside a throwaway Rocky 9 container
+# Host-side dispatch: run the block above inside a throwaway Rocky container
 # ---------------------------------------------------------------------------
 CYCLES=5
 MULTI_TENANT=0
@@ -326,8 +344,8 @@ if ! command -v docker &>/dev/null; then
   exit 1
 fi
 
-if [ ! -d "${SCRIPT_DIR}/output/RPMS" ]; then
-  echo "ERROR: ${SCRIPT_DIR}/output/RPMS not found — run agent-build-loop.sh first."
+if [ ! -d "${SCRIPT_DIR}/output/el${EL_VERSION}/RPMS" ]; then
+  echo "ERROR: ${SCRIPT_DIR}/output/el${EL_VERSION}/RPMS not found — run agent-build-loop.sh (EL_VERSION=${EL_VERSION}) first."
   exit 1
 fi
 
@@ -338,5 +356,6 @@ docker run --privileged --rm \
   -v "${SCRIPT_DIR}:/src:ro" \
   -e "CYCLES=${CYCLES}" \
   -e "MULTI_TENANT=${MULTI_TENANT}" \
+  -e "EL_VERSION=${EL_VERSION}" \
   "${IMAGE_NAME}" \
   bash /src/local-smoke-test.sh --in-container

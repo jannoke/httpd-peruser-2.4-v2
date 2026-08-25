@@ -2,7 +2,8 @@
 # Non-interactive build script designed for use by the Copilot coding agent.
 #
 # Usage (run from the repository root or from src/):
-#   ./src/agent-build-loop.sh
+#   ./src/agent-build-loop.sh                # el9 (default)
+#   EL_VERSION=10 ./src/agent-build-loop.sh    # el10
 #
 # Exit codes:
 #   0  - Build succeeded
@@ -28,11 +29,29 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-IMAGE_NAME="httpd-peruser-devbuild"
-CONTAINER_NAME="httpd-peruser-agent-build"
-OUTPUT_DIR="${SCRIPT_DIR}/output"
+EL_VERSION="${EL_VERSION:-9}"
+case "$EL_VERSION" in
+    9)
+        BASE_IMAGE="rockylinux:9"
+        ;;
+    10)
+        # el10 is not published under the plain `rockylinux` Docker Hub
+        # namespace the way 8/9 are.
+        BASE_IMAGE="rockylinux/rockylinux:10"
+        ;;
+    *)
+        echo "=== BUILD FAILED ==="
+        echo "ERROR: unsupported EL_VERSION '${EL_VERSION}' (expected 9 or 10)"
+        exit 1
+        ;;
+esac
+
+IMAGE_NAME="httpd-peruser-devbuild-el${EL_VERSION}"
+CONTAINER_NAME="httpd-peruser-agent-build-el${EL_VERSION}"
+OUTPUT_DIR="${SCRIPT_DIR}/output/el${EL_VERSION}"
 
 echo "=== AGENT BUILD LOOP START ==="
+echo "EL version       : ${EL_VERSION} (base image: ${BASE_IMAGE})"
 echo "Source directory : ${SCRIPT_DIR}"
 echo "Patch file       : ${SCRIPT_DIR}/peruser-2.4-httpd24-fix.patch"
 echo ""
@@ -51,7 +70,8 @@ fi
 # Build the development container image (uses cache if unchanged)
 # ---------------------------------------------------------------------------
 echo "--- Building container image (${IMAGE_NAME}) ---"
-if ! docker build -t "${IMAGE_NAME}" -f "${SCRIPT_DIR}/Dockerfile.devbuild" "${SCRIPT_DIR}" 2>&1; then
+if ! docker build --build-arg BASE_IMAGE="${BASE_IMAGE}" \
+    -t "${IMAGE_NAME}" -f "${SCRIPT_DIR}/Dockerfile.devbuild" "${SCRIPT_DIR}" 2>&1; then
     echo ""
     echo "=== BUILD FAILED ==="
     echo "ERROR: Failed to build Docker image. Check Dockerfile.devbuild for errors."
