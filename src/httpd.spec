@@ -13,7 +13,7 @@
 Summary:              Apache HTTP Server
 Name:                 httpd
 Version:              2.4.62
-Release:              1%{?dist}.3.peruser.040.v16.taavi
+Release:              1%{?dist}.4.peruser.040.v16.taavi
 URL:                  https://httpd.apache.org/
 Source0:              https://www.apache.org/dist/httpd/httpd-%{version}.tar.bz2
 Source1:              https://www.apache.org/dist/httpd/httpd-%{version}.tar.bz2.asc
@@ -115,7 +115,7 @@ License:              ASL 2.0
 BuildRequires:        gcc, autoconf, pkgconfig, findutils, xmlto
 BuildRequires:        perl-interpreter, perl-generators, systemd-devel
 BuildRequires:        zlib-devel, libselinux-devel, lua-devel, brotli-devel
-BuildRequires:        apr-devel >= 1.5.0, apr-util-devel >= 1.5.0, pcre-devel >= 5.0
+BuildRequires:        apr-devel >= 1.5.0, apr-util-devel >= 1.5.0, pcre2-devel
 BuildRequires:        gnupg2
 BuildRequires:        systemd-rpm-macros
 Requires:             system-logos-httpd
@@ -365,7 +365,7 @@ export LYNX_PATH=/usr/bin/links
         --with-suexec-uidmin=1000 --with-suexec-gidmin=1000 \
         --with-brotli \
         --enable-pie \
-        --with-pcre=/usr/bin/pcre-config \
+        --with-pcre=/usr/bin/pcre2-config \
         --enable-mods-shared=all \
         --enable-ssl --disable-distcache \
         --enable-proxy --enable-proxy-fdpass \
@@ -832,6 +832,10 @@ exit $rv
 %{_rpmconfigdir}/macros.d/macros.httpd
 
 %changelog
+* Sat Oct 31 2026 Janno Sannik <janno@kood.ee> - 2.4.62-1.4.peruser.040.v16
+- Cgroup: write the processor's pid to cgroup.procs (cgroup v2), falling back
+  to tasks (v1), and join the cgroup before a Chroot
+
 * Fri Mar 07 2025 Janno Sannik <janno@kood.ee> - 2.4.62-1.3.peruser.040.v16
 - Fix peruser patch for httpd 2.4 API compatibility:
   - Update ap_mpm_run() to use ap_hook_mpm() mechanism

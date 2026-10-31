@@ -10,12 +10,22 @@ on:
 
 jobs:
   build-rpm:
-    name: Build SRPM and RPM (Rocky Linux 9)
+    name: Build SRPM and RPM (EL${{ matrix.el_version }})
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - el_version: "9"
+            image: rockylinux:9
+          - el_version: "10"
+            # el10 is not published under the plain `rockylinux` Docker Hub
+            # namespace the way 8/9 are.
+            image: rockylinux/rockylinux:10
     container:
-      image: rockylinux:9
+      image: ${{ matrix.image }}
 
     steps:
       - name: Checkout repository
@@ -43,7 +53,7 @@ jobs:
             brotli-devel \
             apr-devel \
             apr-util-devel \
-            pcre-devel \
+            pcre2-devel \
             gnupg2 \
             systemd-rpm-macros \
             openssl-devel \
@@ -92,7 +102,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: srpm
+          name: srpm-el${{ matrix.el_version }}
           path: ~/rpmbuild/SRPMS/*.src.rpm
           if-no-files-found: warn
 
@@ -100,7 +110,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: rpms
+          name: rpms-el${{ matrix.el_version }}
           path: ~/rpmbuild/RPMS/**/*.rpm
           if-no-files-found: warn
 
@@ -108,25 +118,35 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-logs
+          name: build-logs-el${{ matrix.el_version }}
           path: /tmp/*-build.log
           if-no-files-found: ignore
 
   test-rpm:
-    name: Test Peruser MPM (Rocky Linux 9)
+    name: Test Peruser MPM (EL${{ matrix.el_version }})
     needs: build-rpm
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - el_version: "9"
+            image: rockylinux:9
+          - el_version: "10"
+            # el10 is not published under the plain `rockylinux` Docker Hub
+            # namespace the way 8/9 are.
+            image: rockylinux/rockylinux:10
     container:
-      image: rockylinux:9
+      image: ${{ matrix.image }}
       options: --privileged
 
     steps:
       - name: Download built RPMs
         uses: actions/download-artifact@v4
         with:
-          name: rpms
+          name: rpms-el${{ matrix.el_version }}
           path: /tmp/rpms
 
       - name: Install base test dependencies
@@ -645,6 +665,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-artifacts
+          name: debug-artifacts-el${{ matrix.el_version }}
           path: /tmp/debug-artifacts/
           if-no-files-found: ignore
