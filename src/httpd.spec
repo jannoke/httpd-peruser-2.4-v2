@@ -13,7 +13,7 @@
 Summary:              Apache HTTP Server
 Name:                 httpd
 Version:              2.4.62
-Release:              1%{?dist}.3.peruser.040.v16.taavi
+Release:              1%{?dist}.4.peruser.040.v16.taavi
 URL:                  https://httpd.apache.org/
 Source0:              https://www.apache.org/dist/httpd/httpd-%{version}.tar.bz2
 Source1:              https://www.apache.org/dist/httpd/httpd-%{version}.tar.bz2.asc
@@ -832,6 +832,10 @@ exit $rv
 %{_rpmconfigdir}/macros.d/macros.httpd
 
 %changelog
+* Sat Oct 31 2026 Janno Sannik <janno@kood.ee> - 2.4.62-1.4.peruser.040.v16
+- Cgroup: write the processor's pid to cgroup.procs (cgroup v2), falling back
+  to tasks (v1), and join the cgroup before a Chroot
+
 * Fri Mar 07 2025 Janno Sannik <janno@kood.ee> - 2.4.62-1.3.peruser.040.v16
 - Fix peruser patch for httpd 2.4 API compatibility:
   - Update ap_mpm_run() to use ap_hook_mpm() mechanism
