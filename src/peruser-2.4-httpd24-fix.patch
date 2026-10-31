@@ -465,7 +465,7 @@
 +#endif /* AP_MPM_DEFAULT_H */
 --- a/server/mpm/peruser/peruser.c
 +++ b/server/mpm/peruser/peruser.c
-@@ -0,0 +1,4750 @@
+@@ -0,0 +1,4749 @@
 +/* ====================================================================
 + * The Apache Software License, Version 1.1
 + *
@@ -678,9 +678,10 @@
 +#define CHILD_STATUS_ACTIVE   3  /* is currently busy handling requests */
 +#define CHILD_STATUS_RESTART  4  /* child about to die and restart */
 +
-+/* cgroup settings */
++/* cgroup settings: v2 (the unified hierarchy) takes the pid in cgroup.procs,
++ * v1 in tasks */
++#define CGROUP_PROCS_FILE "/cgroup.procs"
 +#define CGROUP_TASKS_FILE "/tasks"
-+#define CGROUP_TASKS_FILE_LEN 7
 +
 +/* config globals */
 +
@@ -2242,43 +2243,42 @@
 +        apr_pool_t *pool)
 +{
 +    apr_file_t *file;
-+    int length;
++    apr_status_t rv;
 +    apr_size_t content_len;
-+    char *tasks_file, *content, *pos;
++    const char *procs_file, *content;
 +
 +    _DBG("starting to add pid to cgroup %s", senv->cgroup);
 +
-+    length = strlen(senv->cgroup) + CGROUP_TASKS_FILE_LEN;
-+    tasks_file = malloc(length);
-+
-+    if (!tasks_file) {
-+        return -1;
-+    }
-+
-+    pos = apr_cpystrn(tasks_file, senv->cgroup, length);
-+    apr_cpystrn(pos, CGROUP_TASKS_FILE, CGROUP_TASKS_FILE_LEN);
-+
-+    /* Prepare the data to be written to tasks file */
 +    content = apr_itoa(pool, ap_my_pid);
 +    content_len = strlen(content);
 +
-+    _DBG("writing pid %s to tasks file %s", content, tasks_file);
++    procs_file = apr_pstrcat(pool, senv->cgroup, CGROUP_PROCS_FILE, NULL);
++    rv = apr_file_open(&file, procs_file, APR_WRITE, APR_OS_DEFAULT, pool);
++    if (APR_STATUS_IS_ENOENT(rv)) {
++        procs_file = apr_pstrcat(pool, senv->cgroup, CGROUP_TASKS_FILE, NULL);
++        rv = apr_file_open(&file, procs_file, APR_WRITE, APR_OS_DEFAULT, pool);
++    }
 +
-+    if (apr_file_open(&file, tasks_file, APR_WRITE, APR_OS_DEFAULT, pool)) {
++    if (rv != APR_SUCCESS) {
 +        if (senv->error_cgroup == 0) {
-+            ap_log_error(APLOG_MARK, APLOG_ALERT, errno, NULL,
-+                         "cgroup: unable to open file %s", tasks_file);
++            ap_log_error(APLOG_MARK, APLOG_ALERT, rv, NULL,
++                         "cgroup: unable to open cgroup.procs (v2) or tasks (v1) in %s",
++                         senv->cgroup);
 +        }
 +
 +        senv->error_cgroup = 1;
-+        free(tasks_file);
 +        return OK; /* don't fail if cgroup not available */
 +    }
 +
-+    if (apr_file_write(file, content, &content_len)) {
++    _DBG("writing pid %s to %s", content, procs_file);
++
++    /* Unbuffered, so an error from the kernel (no such cgroup, a v2 cgroup
++     * with controllers in use below it) shows up here */
++    rv = apr_file_write(file, content, &content_len);
++    if (rv != APR_SUCCESS) {
 +        if (senv->error_cgroup == 0) {
-+            ap_log_error(APLOG_MARK, APLOG_ALERT, errno, NULL,
-+                         "cgroup: unable to write pid to file %s", tasks_file);
++            ap_log_error(APLOG_MARK, APLOG_ALERT, rv, NULL,
++                         "cgroup: unable to write pid to file %s", procs_file);
 +        }
 +
 +        senv->error_cgroup = 1;
@@ -2288,8 +2288,6 @@
 +    }
 +
 +    apr_file_close(file);
-+
-+    free(tasks_file);
 +
 +    return OK;
 +}
@@ -2312,6 +2310,11 @@
 +        nice(senv->nice_lvl);
 +    }
 +
++    /* Before the chroot: the cgroup path is outside it */
++    if (senv->cgroup) {
++        peruser_setup_cgroup(childnum, senv, pool);
++    }
++
 +    if (senv->chroot) {
 +        _DBG("chdir to %s", senv->chroot);
 +
@@ -2328,10 +2331,6 @@
 +                         senv->chroot);
 +            return -1;
 +        }
-+    }
-+
-+    if (senv->cgroup) {
-+        peruser_setup_cgroup(childnum, senv, pool);
 +    }
 +
 +#ifdef PERUSER_PAM_SESSION
