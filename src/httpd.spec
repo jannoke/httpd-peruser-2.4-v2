@@ -13,7 +13,7 @@
 Summary:              Apache HTTP Server
 Name:                 httpd
 Version:              2.4.62
-Release:              1%{?dist}.5.peruser.040.v16.taavi
+Release:              1%{?dist}.5.peruser.dc
 URL:                  https://httpd.apache.org/
 Source0:              https://www.apache.org/dist/httpd/httpd-%{version}.tar.bz2
 Source1:              https://www.apache.org/dist/httpd/httpd-%{version}.tar.bz2.asc
@@ -835,7 +835,7 @@ exit $rv
 %{_rpmconfigdir}/macros.d/macros.httpd
 
 %changelog
-* Mon Nov 02 2026 Janno Sannik <janno@kood.ee> - 2.4.62-1.5.peruser.040.v16
+* Mon Nov 02 2026 Janno Sannik <janno@kood.ee> - 2.4.62-1.5.peruser.dc
 - Add mod_handler_guard: server-status, server-info and balancer-manager are
   refused (403) except in a VirtualHost with HandlerGuardAllow On, so a
   tenant's .htaccess (SetHandler server-status) can't read the whole server
