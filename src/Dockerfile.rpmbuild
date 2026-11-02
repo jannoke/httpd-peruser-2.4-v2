@@ -1,7 +1,9 @@
 # Dockerfile for building httpd peruser RPM
-# Uses AlmaLinux 9 (RHEL 9 compatible)
+# Uses AlmaLinux (RHEL compatible). Defaults to el9; pass
+# --build-arg BASE_IMAGE=almalinux:10 for el10.
 # Build context should be the src/ directory containing all source files
-FROM almalinux:9
+ARG BASE_IMAGE=almalinux:9
+FROM ${BASE_IMAGE}
 
 # Install build dependencies
 RUN dnf install dnf-plugins-core -y
@@ -24,7 +26,7 @@ RUN dnf install -y \
     brotli-devel \
     apr-devel \
     apr-util-devel \
-    pcre-devel \
+    pcre2-devel \
     gnupg2 \
     systemd-rpm-macros \
     openssl-devel \

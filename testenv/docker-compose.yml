@@ -1,0 +1,15 @@
+services:
+  peruser-httpd:
+    build:
+      context: ..
+      dockerfile: testenv/Dockerfile
+      args:
+        # el9 by default. For el10:
+        #   EL_VERSION=10 BASE_IMAGE=rockylinux/rockylinux:10 docker compose build
+        # (el10's image lives under a different Docker Hub namespace than 8/9,
+        # so BASE_IMAGE can't be derived from EL_VERSION alone.)
+        EL_VERSION: "${EL_VERSION:-9}"
+        BASE_IMAGE: "${BASE_IMAGE:-rockylinux:9}"
+    container_name: "peruser-httpd-test-el${EL_VERSION:-9}"
+    ports:
+      - "8090:80"

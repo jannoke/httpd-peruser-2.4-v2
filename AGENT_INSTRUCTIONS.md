@@ -14,9 +14,11 @@ without errors. Iterate until the build succeeds, then commit.
 
 ## The Build Script
 
-**Script**: `./src/agent-build-loop.sh`
+**Script**: `./src/agent-build-loop.sh` (set `EL_VERSION=10` to target Rocky
+Linux 10 instead of the el9 default — the patch must compile cleanly on
+both, so re-run under both versions before considering the fix done)
 
-- Runs the full RPM build inside a Docker container (Rocky Linux 9)
+- Runs the full RPM build inside a Docker container (Rocky Linux, el9 or el10)
 - Exits with code **0** on success, **non-zero** on failure
 - Outputs clear markers you can parse:
   - `=== BUILD SUCCEEDED ===` — done, commit and push
@@ -128,9 +130,9 @@ or check whether the function has been renamed.
 | File | Purpose |
 |------|---------|
 | `src/peruser-2.4-httpd24-fix.patch` | **The patch to fix** — this is what you edit |
-| `src/agent-build-loop.sh` | Build script — run this to test your fix |
+| `src/agent-build-loop.sh` | Build script — run this to test your fix (`EL_VERSION=9\|10`) |
 | `src/httpd.spec` | RPM spec — shows how the patch is applied (`%patch300`) |
-| `src/Dockerfile.devbuild` | Rocky Linux 9 build container definition |
+| `src/Dockerfile.devbuild` | Rocky Linux build container definition (el9/el10 via `BASE_IMAGE` build arg) |
 | `src/build-rpm-dev.sh` | In-container build script (called by agent-build-loop.sh) |
 
 ---

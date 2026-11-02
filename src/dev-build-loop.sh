@@ -2,14 +2,16 @@
 # Interactive local development build loop for httpd peruser patch debugging.
 #
 # Usage (run from the repository root or from src/):
-#   ./src/dev-build-loop.sh
+#   ./src/dev-build-loop.sh                 # el9 (default)
+#   EL_VERSION=10 ./src/dev-build-loop.sh    # el10
 #
 # Workflow:
-#   1. Builds (or reuses) a Rocky Linux 9 development container.
+#   1. Builds (or reuses) a Rocky Linux development container matching
+#      EL_VERSION (el9 -> rockylinux:9, el10 -> rockylinux/rockylinux:10).
 #   2. Mounts the src/ directory into the container as /src.
 #   3. Runs rpmbuild in a loop.
 #      - On failure: shows the error output and waits for you to fix the patch.
-#      - On success: copies build artifacts to src/output/ and exits.
+#      - On success: copies build artifacts to src/output/el${EL_VERSION}/ and exits.
 #   4. Once it builds cleanly, commit and push to trigger the full CI workflow.
 
 set -euo pipefail
@@ -29,13 +31,30 @@ NC='\033[0m'
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-IMAGE_NAME="httpd-peruser-devbuild"
-CONTAINER_NAME="httpd-peruser-dev"
-OUTPUT_DIR="${SCRIPT_DIR}/output"
+EL_VERSION="${EL_VERSION:-9}"
+case "$EL_VERSION" in
+    9)
+        BASE_IMAGE="rockylinux:9"
+        ;;
+    10)
+        # el10 is not published under the plain `rockylinux` Docker Hub
+        # namespace the way 8/9 are.
+        BASE_IMAGE="rockylinux/rockylinux:10"
+        ;;
+    *)
+        echo -e "${RED}ERROR: unsupported EL_VERSION '${EL_VERSION}' (expected 9 or 10)${NC}"
+        exit 1
+        ;;
+esac
+
+IMAGE_NAME="httpd-peruser-devbuild-el${EL_VERSION}"
+CONTAINER_NAME="httpd-peruser-dev-el${EL_VERSION}"
+OUTPUT_DIR="${SCRIPT_DIR}/output/el${EL_VERSION}"
 
 echo -e "${BLUE}${BOLD}============================================${NC}"
 echo -e "${BLUE}${BOLD}  httpd peruser - Local Dev Build Loop      ${NC}"
 echo -e "${BLUE}${BOLD}============================================${NC}"
+echo -e "EL version       : ${EL_VERSION} (base image: ${BASE_IMAGE})"
 echo -e "Source directory : ${SCRIPT_DIR}"
 echo -e "Patch file       : ${SCRIPT_DIR}/peruser-2.4-httpd24-fix.patch"
 echo ""
@@ -53,7 +72,8 @@ fi
 # Build (or rebuild) the development container image
 # ---------------------------------------------------------------------------
 echo -e "${YELLOW}Building development container image (${IMAGE_NAME})...${NC}"
-docker build -t "${IMAGE_NAME}" -f "${SCRIPT_DIR}/Dockerfile.devbuild" "${SCRIPT_DIR}"
+docker build --build-arg BASE_IMAGE="${BASE_IMAGE}" \
+    -t "${IMAGE_NAME}" -f "${SCRIPT_DIR}/Dockerfile.devbuild" "${SCRIPT_DIR}"
 echo -e "${GREEN}Container image ready.${NC}"
 echo ""
 

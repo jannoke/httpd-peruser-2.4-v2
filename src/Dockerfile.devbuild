@@ -1,7 +1,10 @@
 # Dockerfile for the local development build environment
-# Uses Rocky Linux 9 to match the GitHub Actions CI environment
+# Uses Rocky Linux to match the GitHub Actions CI environment. Defaults to
+# el9 (rockylinux:9); pass --build-arg BASE_IMAGE=rockylinux/rockylinux:10
+# for el10 (the el10 image lives under a different Docker Hub namespace).
 # The src/ directory is mounted at /src for live editing
-FROM rockylinux:9
+ARG BASE_IMAGE=rockylinux:9
+FROM ${BASE_IMAGE}
 
 # Enable the CodeReady Builder (CRB) repository for additional build dependencies
 RUN dnf install -y dnf-plugins-core && \
@@ -25,7 +28,7 @@ RUN dnf install -y \
         brotli-devel \
         apr-devel \
         apr-util-devel \
-        pcre-devel \
+        pcre2-devel \
         gnupg2 \
         systemd-rpm-macros \
         openssl-devel \
