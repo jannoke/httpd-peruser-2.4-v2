@@ -13,7 +13,7 @@
 Summary:              Apache HTTP Server
 Name:                 httpd
 Version:              2.4.62
-Release:              1%{?dist}.4.peruser.040.v16.taavi
+Release:              1%{?dist}.5.peruser.dc
 URL:                  https://httpd.apache.org/
 Source0:              https://www.apache.org/dist/httpd/httpd-%{version}.tar.bz2
 Source1:              https://www.apache.org/dist/httpd/httpd-%{version}.tar.bz2.asc
@@ -109,6 +109,8 @@ Patch104:             httpd-2.4.62-r1921299.patch
 
 #DataCode Peruser (httpd 2.4 compatible, SSL parts disabled)
 Patch300: peruser-2.4-httpd24-fix.patch
+# DataPanel: mod_handler_guard, server-status/server-info only where allowed
+Patch301: httpd-2.4.62-handler-guard.patch
 
 
 License:              ASL 2.0
@@ -271,6 +273,7 @@ written in the Lua programming language.
 
 #DataCode Peruser
 %patch300 -p1 -b .peruser
+%patch301 -p1 -b .handler-guard
 
 # Patch in the vendor string
 sed -i '/^#define PLATFORM/s/Unix/%{vstring}/' os/unix/os.h
@@ -832,6 +835,11 @@ exit $rv
 %{_rpmconfigdir}/macros.d/macros.httpd
 
 %changelog
+* Mon Nov 02 2026 Janno Sannik <janno@kood.ee> - 2.4.62-1.5.peruser.dc
+- Add mod_handler_guard: server-status, server-info and balancer-manager are
+  refused (403) except in a VirtualHost with HandlerGuardAllow On, so a
+  tenant's .htaccess (SetHandler server-status) can't read the whole server
+
 * Sat Oct 31 2026 Janno Sannik <janno@kood.ee> - 2.4.62-1.4.peruser.040.v16
 - Cgroup: write the processor's pid to cgroup.procs (cgroup v2), falling back
   to tasks (v1), and join the cgroup before a Chroot
