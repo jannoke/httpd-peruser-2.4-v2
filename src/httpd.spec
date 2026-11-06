@@ -13,7 +13,7 @@
 Summary:              Apache HTTP Server
 Name:                 httpd
 Version:              2.4.62
-Release:              1%{?dist}.5.peruser.dc
+Release:              1%{?dist}.6.peruser.dc
 URL:                  https://httpd.apache.org/
 Source0:              https://www.apache.org/dist/httpd/httpd-%{version}.tar.bz2
 Source1:              https://www.apache.org/dist/httpd/httpd-%{version}.tar.bz2.asc
@@ -835,6 +835,12 @@ exit $rv
 %{_rpmconfigdir}/macros.d/macros.httpd
 
 %changelog
+* Fri Nov 06 2026 Janno Sannik <janno@kood.ee> - 2.4.62-1.6.peruser.dc
+- peruser: the "too many spare workers" rule (MaxSpareProcessors) stops only
+  idle workers. It killed busy ones too, mid-request: the client got a 502,
+  the killed child aborted with a core dump, and one pass took out every
+  busy worker of the processor.
+
 * Mon Nov 02 2026 Janno Sannik <janno@kood.ee> - 2.4.62-1.5.peruser.dc
 - Add mod_handler_guard: server-status, server-info and balancer-manager are
   refused (403) except in a VirtualHost with HandlerGuardAllow On, so a
