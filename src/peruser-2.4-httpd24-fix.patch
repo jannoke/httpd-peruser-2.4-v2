@@ -465,7 +465,7 @@
 +#endif /* AP_MPM_DEFAULT_H */
 --- a/server/mpm/peruser/peruser.c
 +++ b/server/mpm/peruser/peruser.c
-@@ -0,0 +1,4749 @@
+@@ -0,0 +1,4758 @@
 +/* ====================================================================
 + * The Apache Software License, Version 1.1
 + *
@@ -3242,9 +3242,18 @@
 +            return 1;
 +        }
 +
-+        /* Dont kill a recent created child */
++        /* Too many spare workers: stop this one, but only if it is idle
++           itself. Without the two status checks, a busy worker was killed
++           in the middle of its request (the client got a 502, the child
++           aborted in its exit cleanup), and since only an idle child is
++           taken off idle_processors by the caller, one pass killed every busy
++           worker of the processor. Both: child->status is what
++           idle_processors counts (so the pass stops at the excess), the
++           scoreboard says the child is not inside a request.
++           Dont kill a recent created child (idle_time > 0). */
 +        if (idle_time > 0 && child->type == CHILD_TYPE_WORKER
-+            /* && child->status == CHILD_STATUS_READY */
++            && child->status == CHILD_STATUS_READY
++            && child_sb->status == SERVER_READY
 +            && child->senv->max_free_processors > 0
 +            && child->senv->idle_processors >= child->senv->max_free_processors) {
 +            /* Too many spare workers available */
