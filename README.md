@@ -44,8 +44,8 @@ cd src/
 EL_VERSION=10 ./build-rpm.sh  # el10
 ```
 
-RPMs are written to `src/output/el9/` or `src/output/el10/` (matching
-`EL_VERSION`) when the build succeeds.
+RPMs are written to `src/output/el9/RPMS/` or `src/output/el10/RPMS/` (matching
+`EL_VERSION`, the source RPM to `SRPMS/` beside it) when the build succeeds.
 
 ---
 

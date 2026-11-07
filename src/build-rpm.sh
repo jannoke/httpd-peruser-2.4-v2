@@ -31,7 +31,9 @@ OUTPUT_DIR="$SCRIPT_DIR/output/el${EL_VERSION}"
 echo "=== Building httpd peruser RPM (EL${EL_VERSION}, base image: ${BASE_IMAGE}) ==="
 echo "Build context: $SCRIPT_DIR"
 
-mkdir -p "$OUTPUT_DIR"
+# RPMS/ and SRPMS/ as in the other build scripts: local-smoke-test.sh and the
+# datapanel glue compose (rpms: .../output/el10/RPMS) read RPMS/
+mkdir -p "$OUTPUT_DIR/RPMS" "$OUTPUT_DIR/SRPMS"
 
 # Build the Docker image
 echo "Building Docker image..."
@@ -42,9 +44,10 @@ docker build --build-arg BASE_IMAGE="$BASE_IMAGE" \
 echo "Running RPM build..."
 docker run --rm \
     --name "$CONTAINER_NAME" \
-    -v "$OUTPUT_DIR:/root/rpmbuild/RPMS" \
+    -v "$OUTPUT_DIR/RPMS:/root/rpmbuild/RPMS" \
+    -v "$OUTPUT_DIR/SRPMS:/root/rpmbuild/SRPMS" \
     "$IMAGE_NAME"
 
 echo "=== Build complete ==="
-echo "RPMs are in: $OUTPUT_DIR/"
-ls -la "$OUTPUT_DIR/" 2>/dev/null || echo "Note: mount output directory to collect RPMs"
+echo "RPMs are in: $OUTPUT_DIR/RPMS/ (source RPM: SRPMS/)"
+find "$OUTPUT_DIR" -name '*.rpm' 2>/dev/null || echo "Note: mount output directory to collect RPMs"
