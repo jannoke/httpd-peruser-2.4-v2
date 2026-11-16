@@ -465,7 +465,7 @@
 +#endif /* AP_MPM_DEFAULT_H */
 --- a/server/mpm/peruser/peruser.c
 +++ b/server/mpm/peruser/peruser.c
-@@ -0,0 +1,4963 @@
+@@ -0,0 +1,5033 @@
 +/* ====================================================================
 + * The Apache Software License, Version 1.1
 + *
@@ -605,6 +605,7 @@
 +#include <setjmp.h>
 +
 +#include <signal.h>
++#include <pthread.h>
 +#include <sys/times.h>
 +#ifdef __linux__
 +#include <sys/prctl.h>
@@ -1265,10 +1266,31 @@
 + * Connection structures and accounting...
 + */
 +
++/* SIGTERM, SIGHUP and SIGINT in a child. Only async-signal-safe calls here:
++ * the signal can land anywhere, inside malloc() or while a lock is held.
++ * Up to .7 this ran clean_child_exit(): apr_pool_destroy() and exit() from
++ * the handler. On 2026-11-16 (dcw-ds-1) a SIGTERM landed in malloc() inside
++ * mod_proxy's child_init, the pool destroy deadlocked on malloc's own lock,
++ * the child stayed alive holding proxy_mutex, and no new child could start
++ * until httpd was restarted. The same handler running in mod_watchdog's
++ * thread freed memory the main thread still used (the cores at every stop).
++ * _exit() skips the pool cleanups: the kernel closes the sockets and files,
++ * php-fpm sees the connection close, and the parent marks the slot dead
++ * when it reaps the child. */
 +static void just_die(int sig)
 +{
-+    _DBG("function called");
-+    clean_child_exit(0);
++    (void)sig;
++    _exit(0);
++}
++
++/* The signals a child dies on. They stay blocked from before fork() until
++ * the child is ready (see make_child() and child_main()). */
++static void startup_signals(sigset_t *set)
++{
++    sigemptyset(set);
++    sigaddset(set, SIGTERM);
++    sigaddset(set, SIGHUP);
++    sigaddset(set, SIGINT);
 +}
 +
 +/* volatile just in case */
@@ -2823,6 +2845,21 @@
 +
 +    ap_create_sb_handle(&sbh, pchild, my_child_num, 0);
 +    (void) ap_update_child_status(sbh, SERVER_READY, (request_rec *) NULL);
++    /* The scoreboard sets last_used on SERVER_READY only with ExtendedStatus
++     * On. Without it, ExpireTimeout would see the slot's previous occupant's
++     * time and stop this child on the next pass. */
++    ap_scoreboard_image->servers[my_child_num][0].last_used = apr_time_now();
++
++    /* Startup is over: let SIGTERM, SIGHUP and SIGINT in, in this thread.
++     * They were blocked since make_child(), so none could land inside a
++     * child_init hook with a lock held. Threads that child_init started
++     * (mod_watchdog's) inherited the blocked mask and keep it, so the
++     * signals come to this thread only. */
++    {
++        sigset_t set;
++        startup_signals(&set);
++        pthread_sigmask(SIG_UNBLOCK, &set, NULL);
++    }
 +
 +    /* Set up the pollfd array */
 +    listensocks = apr_pcalloc(pchild, sizeof(*listensocks) * (num_listensocks));
@@ -3254,6 +3291,7 @@
 +static int make_child(server_rec *s, int slot)
 +{
 +    int pid;
++    sigset_t startup_set, parent_mask;
 +
 +    _DBG("function entered slot=%d", slot);
 +    dump_server_env_image();
@@ -3288,6 +3326,13 @@
 +
 +    CHILD_INFO_TABLE[slot].status = CHILD_STATUS_READY;
 +
++    /* Block the signals a child dies on across fork(): the child keeps them
++     * blocked until it is ready (child_main() lets them in), the parent
++     * restores its mask right after fork(). A signal sent meanwhile stays
++     * pending and is taken then. */
++    startup_signals(&startup_set);
++    sigprocmask(SIG_BLOCK, &startup_set, &parent_mask);
++
 +#ifdef _OSD_POSIX
 +    /* BS2000 requires a "special" version of fork() before a setuid() call */
 +    if ((pid = os_fork(ap_unixd_config.user_name)) == -1) {
@@ -3304,6 +3349,7 @@
 +         */
 +        (void) ap_update_child_status_from_indexes(slot, 0, SERVER_DEAD,
 +                                                   (request_rec *) NULL);
++        sigprocmask(SIG_SETMASK, &parent_mask, NULL);
 +
 +        /* In case system resources are maxxed out, we don't want
 +         Apache running away with the CPU trying to fork over and
@@ -3339,6 +3385,8 @@
 +        clean_child_exit(0);
 +    }
 +
++    sigprocmask(SIG_SETMASK, &parent_mask, NULL);
++
 +    ap_scoreboard_image->parent[slot].pid = pid;
 +    CHILD_INFO_TABLE[slot].pid = pid;
 +    CHILD_INFO_TABLE[slot].senv->active_processors++;
@@ -3364,6 +3412,28 @@
 +                                worker_score *child_sb, apr_time_t now)
 +{
 +    time_t idle_time = apr_time_sec(now - child_sb->last_used);
++
++    /* Never stop a child that is still starting (fork() to SERVER_READY):
++     * it can't take the signal yet anyway (make_child() blocks it), and up
++     * to .7 the signal could land inside a child_init hook with a lock held.
++     * Its last_used is still the slot's previous occupant's, so the
++     * ExpireTimeout rules below took a child started in a slot unused for
++     * longer than ExpireTimeout for an expired one. Logged when that rule
++     * would have stopped it: the trigger of 2026-11-16, if that's what it was. */
++    if (child_sb->status == SERVER_STARTING) {
++        if ((child->type == CHILD_TYPE_PROCESSOR || child->type == CHILD_TYPE_WORKER)
++            && expire_timeout > 0 && idle_time > expire_timeout
++            && !(child->senv->min_processors > 0
++                 && child->senv->total_processes <= child->senv->min_processors)) {
++            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, ap_server_conf,
++                         "peruser: not stopping child #%d (pid %d, processor %s): "
++                         "it is still starting; up to .7 ExpireTimeout (%d s) "
++                         "stopped it here, its slot was unused for %ld s",
++                         childnum, (int)ap_scoreboard_image->parent[childnum].pid,
++                         child->senv->name, expire_timeout, (long)idle_time);
++        }
++        return 0;
++    }
 +
 +    /* All active processors must be killed after ExpireTimeout, regardless
 +       MinProcessors, or infinite loop processors will never end  */       

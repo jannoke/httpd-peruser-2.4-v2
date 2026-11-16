@@ -31,9 +31,35 @@ set `EL_VERSION`.
 │   ├── agent-build-loop.sh           # Non-interactive build script (agent use)
 │   ├── local-smoke-test.sh           # Install the RPMs, start/request/stop cycles
 │   ├── spare-kill-test.sh            # Regression: MaxSpareProcessors never stops a busy copy (.6)
-│   └── pass-timeout-test.sh          # Regression: a processor that takes nothing can't stop the server (.7)
+│   ├── pass-timeout-test.sh          # Regression: a processor that takes nothing can't stop the server (.7)
+│   └── startup-hang-test.sh          # Regression: a SIGTERM during a child's startup can't stop the server (.8)
 └── README.md                         # This file
 ```
+
+## Signals in a starting child (`.8.peruser.dc`)
+
+Up to `.7`, a child's SIGTERM handler (`just_die`) ran `apr_pool_destroy()` and `exit()` inside the
+handler, and peruser's parent sends SIGTERM all the time (IdleTimeout, ExpireTimeout, spare
+processors). On 2026-11-16 (dcw-ds-1, 05:53–07:11 EET) one landed in `malloc()` inside mod_proxy's
+`child_init`. The child deadlocked on malloc's own lock while holding `proxy_mutex`, so every child
+started after it waited for that lock, and no site answered until httpd was restarted. Since `.8`:
+
+- `just_die` only calls `_exit(0)`, which is safe in a signal handler. The kernel closes the
+  sockets, and the parent marks the slot dead when it reaps the child.
+- SIGTERM, SIGHUP and SIGINT are blocked from before `fork()` until the child is ready
+  (`SERVER_READY`). Then the main thread lets them in. Threads that `child_init` started, such as
+  mod_watchdog's, keep them blocked.
+- `determine_child_fate()` never stops a child that is still starting. Its `last_used` is still the
+  slot's previous occupant's, so the ExpireTimeout rules took a child started in a slot unused for
+  longer than ExpireTimeout for an expired one. When that rule would have fired, the error log says
+  `not stopping child #N (pid P, processor X): it is still starting; up to .7 ExpireTimeout ...
+  stopped it here`.
+- A ready child sets its own `last_used`. The scoreboard does that only with ExtendedStatus On.
+
+`startup-hang-test.sh --mode kill` reproduces the outage on `.6`. An LD_PRELOAD `fork()` wrapper
+(`startup-hang-forkterm.c`) sends a SIGTERM to a share of the new children 0–5 ms after the fork,
+and a hang detector backtraces the lock owner. `--mode expire` logs the parent's own kills with
+strace and matches them against each child's age.
 
 ## Directives added in this fork
 
