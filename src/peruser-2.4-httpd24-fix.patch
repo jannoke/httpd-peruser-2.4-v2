@@ -465,7 +465,7 @@
 +#endif /* AP_MPM_DEFAULT_H */
 --- a/server/mpm/peruser/peruser.c
 +++ b/server/mpm/peruser/peruser.c
-@@ -0,0 +1,5033 @@
+@@ -0,0 +1,5551 @@
 +/* ====================================================================
 + * The Apache Software License, Version 1.1
 + *
@@ -716,8 +716,29 @@
 +#endif
 +static int processor_pass_timeout = DEFAULT_PROCESSOR_PASS_TIMEOUT;
 +static int server_limit = DEFAULT_SERVER_LIMIT;
-+static int first_server_limit;
-+static int changed_limit_at_restart;
++
++/* What has to survive the module being unloaded and loaded again. httpd
++ * unloads every DSO on a restart, and between the two configuration passes
++ * at startup, and that resets every static in this file. Up to .8 nothing
++ * was kept: the server never detached, the generation was always 0, the
++ * check for a changed ServerLimit never fired and each load leaked the
++ * previous load's shared tables. */
++typedef struct {
++    int module_loads;           /* times pre_config has run in this process */
++    int first_server_limit;     /* ServerLimit of the first start; the
++                                 * scoreboard was sized with it */
++    ap_generation_t generation; /* the generation, counted across restarts */
++    apr_pool_t *tables_pool;    /* the pool of this load's shared tables */
++} peruser_retained_data;
++static peruser_retained_data *retained;
++
++static int changed_limit_at_restart; /* the ServerLimit a restart asked for */
++static int max_clients_configured;   /* a MaxClients directive was read */
++
++/* The parent's ends of the processors' socket pairs, kept outside the
++ * shared table so that what the parent closes can't be changed by a child. */
++static apr_array_header_t *parent_socks;
++static apr_status_t close_parent_sockets(void *unused);
 +static int requests_this_child;
 +static int mpm_state = AP_MPMQ_STARTING;
 +static ap_pod_t *pod;
@@ -761,6 +782,11 @@
 +    /* ProcessorPassTimeout: until this time the processor's requests get a
 +       503 without waiting (0 = not blocked). Written by the multiplexers. */
 +    apr_time_t pass_blocked_until;
++
++    /* Until this time no new child is started for the processor and its
++       requests get a 503: its last child could not be set up (0 = not
++       blocked). Written by the parent. */
++    apr_time_t start_blocked_until;
 +
 +    /* statistics */
 +    unsigned long stats_requests;    /* requests handled */
@@ -1156,7 +1182,10 @@
 +    *rv = APR_SUCCESS;
 +    switch (query_code) {
 +    case AP_MPMQ_MAX_DAEMON_USED:
-+        *result = ap_daemons_limit;
++        /* The core walks the scoreboard up to this. peruser uses any slot
++         * below ServerLimit, whatever MaxClients says, and the scoreboard
++         * has exactly ServerLimit slots. */
++        *result = server_limit;
 +        break;
 +    case AP_MPMQ_IS_THREADED:
 +        *result = AP_MPMQ_NOT_SUPPORTED;
@@ -1190,6 +1219,9 @@
 +        break;
 +    case AP_MPMQ_MPM_STATE:
 +        *result = mpm_state;
++        break;
++    case AP_MPMQ_GENERATION:
++        *result = ap_my_generation;
 +        break;
 +    default:
 +        *rv = APR_ENOTIMPL;
@@ -1297,8 +1329,20 @@
 +static int volatile shutdown_pending;
 +static int volatile restart_pending;
 +static int volatile is_graceful;
-+/* XXX static int volatile child_fatal; */
++/* Set when a child that the server cannot run without exited with
++ * APEXIT_CHILDFATAL: the main loop then stops the server, and the stop is
++ * reported as a failure. */
++static int child_fatal;
++static pid_t fatal_pid;
 +
++/* Which signal asked for the stop; only for the log line. */
++static int volatile shutdown_signal;
++
++/* sig_term() is the parent's handler for SIGTERM, SIGINT and
++ * AP_SIG_GRACEFUL_STOP (SIGWINCH: "apachectl graceful-stop", and systemd's
++ * KillSignal in the stock httpd.service). peruser has no graceful stop of
++ * its own, so all three stop the server the same way.
++ */
 +static void sig_term(int sig)
 +{
 +    if (shutdown_pending == 1) {
@@ -1308,6 +1352,7 @@
 +         */
 +        return;
 +    }
++    shutdown_signal = sig;
 +    shutdown_pending = 1;
 +}
 +
@@ -1328,8 +1373,8 @@
 +static apr_status_t check_pipe_of_death(void **csd, ap_listen_rec *lr,
 +        apr_pool_t *ptrans)
 +{
-+    int ret;
-+    char pipe_read_char;
++    apr_status_t ret;
++    char pipe_read_char = 0;
 +    apr_size_t n = 1;
 +
 +    _DBG("WATCH: die_now=%d", die_now);
@@ -1344,6 +1389,13 @@
 +         * through a life of servitude. */
 +        _DBG("POD read EAGAIN");
 +        return ret;
++    }
++    else if (ret != APR_SUCCESS || n != 1) {
++        /* Nothing was read (interrupted, or an error): there is no
++         * character to look at. Not APR_EGENERAL, the caller exits on
++         * that. */
++        _DBG("POD read failed");
++        return APR_SUCCESS;
 +    }
 +    else {
 +        if (pipe_read_char != AP_PERUSER_CHAR_OF_DEATH) {
@@ -1408,6 +1460,11 @@
 +        ap_log_error(APLOG_MARK, APLOG_WARNING, errno, ap_server_conf,
 +                     "sigaction(SIGINT)");
 +#endif
++#ifdef AP_SIG_GRACEFUL_STOP
++    if (sigaction(AP_SIG_GRACEFUL_STOP, &sa, NULL) < 0)
++        ap_log_error(APLOG_MARK, APLOG_WARNING, errno, ap_server_conf,
++                     "sigaction(" AP_SIG_GRACEFUL_STOP_STRING ")");
++#endif
 +#ifdef SIGXCPU
 +    sa.sa_handler = SIG_DFL;
 +    if (sigaction(SIGXCPU, &sa, NULL) < 0)
@@ -1462,6 +1519,9 @@
 +    }
 +
 +    apr_signal(SIGTERM, sig_term);
++#ifdef AP_SIG_GRACEFUL_STOP
++    apr_signal(AP_SIG_GRACEFUL_STOP, sig_term);
++#endif /* AP_SIG_GRACEFUL_STOP */
 +#ifdef SIGHUP
 +    apr_signal(SIGHUP, restart);
 +#endif /* SIGHUP */
@@ -1583,7 +1643,21 @@
 +    return;
 +}
 +
++/* How long a processor whose child could not be set up is left alone before
++ * the next try. */
++#ifndef PERUSER_START_BLOCK_SECS
++#define PERUSER_START_BLOCK_SECS 10
++#endif
++
++static int start_blocked(server_env_t *senv)
++{
++    return senv != NULL && senv->start_blocked_until > apr_time_now();
++}
++
 +static void activate_child(child_info_t *child) {
++    if (start_blocked(child->senv)) {
++        return;
++    }
 +    if (child->status == CHILD_STATUS_STANDBY) {
 +        child->status = CHILD_STATUS_STARTING;
 +
@@ -1602,6 +1676,9 @@
 +    int i, wait_step_size, wait_time;
 +
 +    wait_step_size = 100 / processor_wait_steps;
++    if (wait_step_size < 1) {
++        wait_step_size = 1; /* a step of 0 never finished the wait below */
++    }
 +
 +    /* Protection for graceful restart under high load */
 +    if (!processor->senv) return -1;
@@ -1698,6 +1775,38 @@
 +}
 +
 +/*
++ * The hand-off message, pass_request()/pass_socket() -> receive_connection():
++ *
++ *     header_len | body_len | remote address | headers + NUL | body
++ *
++ * with the client's socket as SCM_RIGHTS. "body" is the part of the request
++ * body that arrived in the same read as the end of the headers (less than
++ * APR_BUCKET_BUFF_SIZE); a socket-only message has both lengths 0 and ends
++ * after the address.
++ *
++ * All the copies of one processor read the same stream socket, each with a
++ * single recvmsg(). So a message has to be queued as one piece (see
++ * pass_atomic_limit()) and has to fit the receiver's buffer whole: a part
++ * left in the stream would be read by the next recvmsg() as the lengths and
++ * address of a new message. PERUSER_MAX_PASS_DATA bounds the headers, their
++ * NUL and the body together; the sender refuses what's larger and the
++ * receiver takes nothing that doesn't add up.
++ */
++#ifndef PERUSER_MAX_PASS_DATA
++#define PERUSER_MAX_PASS_DATA 30000
++#endif
++
++#define PERUSER_PASS_FIXED (2 * sizeof(apr_size_t) + sizeof(apr_sockaddr_t))
++
++/* the largest head plus one read's worth of body always fits a message... */
++typedef char peruser_assert_pass_data_holds_head_and_body[
++    (PERUSER_MAX_HEADER_SIZE + 1 + APR_BUCKET_BUFF_SIZE
++     <= PERUSER_MAX_PASS_DATA) ? 1 : -1];
++/* ...and the largest message is one the kernel queues as one piece */
++typedef char peruser_assert_pass_message_is_atomic[
++    (PERUSER_PASS_FIXED + PERUSER_MAX_PASS_DATA <= 32768) ? 1 : -1];
++
++/*
 + * ProcessorPassTimeout. A multiplexer hands each request to its processor
 + * over the processor's socketpair. When no copy of the processor reads it
 + * (all of them hung: on 2026-11-16 every new child waited forever in
@@ -1712,8 +1821,13 @@
 +{
 +    server_env_t *senv = processor->senv;
 +
-+    if (processor_pass_timeout <= 0 || !senv
-+        || processor->type == CHILD_TYPE_MULTIPLEXER) {
++    if (!senv || processor->type == CHILD_TYPE_MULTIPLEXER) {
++        return 0;
++    }
++    if (start_blocked(senv)) {
++        return 1;
++    }
++    if (processor_pass_timeout <= 0) {
 +        return 0;
 +    }
 +    return senv->pass_blocked_until > apr_time_now();
@@ -1738,8 +1852,8 @@
 +}
 +
 +/* sendmsg() the rest of a message after a partial send, blocking: the
-+   stream must stay in step for the processor. Not expected below
-+   pass_atomic_limit(), kept as a safety net. */
++   stream must stay in step for the processor. Not expected: every message
++   is below pass_atomic_limit(). Kept as a safety net. */
 +static int send_rest_blocking(int fd, struct msghdr *msg, size_t sent)
 +{
 +    size_t i;
@@ -1785,10 +1899,28 @@
 +        len += msg->msg_iov[i].iov_len;
 +    }
 +
-+    if (processor_pass_timeout <= 0 || processor->type == CHILD_TYPE_MULTIPLEXER
-+        || len > pass_atomic_limit(fd)) {
-+        /* as before: a multiplexer target, the timeout off, or a message too
-+           big to be sent in one piece */
++    if (len > pass_atomic_limit(fd)) {
++        /* The kernel would queue it in parts, and the processor's copies
++           would each read a part: the first one the descriptor and a cut-off
++           request, the next one the rest as if it were a new message. Only
++           a send buffer far below the default gets here (the messages are
++           bounded by PERUSER_MAX_PASS_DATA). */
++        if (senv->error_pass == 0) {
++            ap_log_error(APLOG_MARK, APLOG_ERR, 0, ap_server_conf,
++                         "Processor %s: a request of %lu bytes can't be "
++                         "passed in one piece (at most %lu with this socket "
++                         "send buffer, see net.core.wmem_default)",
++                         senv->name, (unsigned long) len,
++                         (unsigned long) pass_atomic_limit(fd));
++        }
++        errno = EMSGSIZE;
++        return -1;
++    }
++
++    if (processor_pass_timeout <= 0
++        || processor->type == CHILD_TYPE_MULTIPLEXER) {
++        /* as before: a multiplexer target, or the timeout off. Blocking,
++           and still all of the message or none of it. */
 +        return sendmsg(fd, msg, 0);
 +    }
 +
@@ -1866,25 +1998,29 @@
 +    struct cmsghdr *cmsg;
 +    apr_sockaddr_t *remote_addr;
 +    int sock_fd;
-+    char *body = "";
-+    struct iovec iov[5];
++    struct iovec iov[3];
 +    apr_size_t header_len = 0;
 +    apr_size_t body_len = 0;
-+    peruser_header h;
 +
++    /* "pool" is ours to destroy, on every way out: it's a child of the
++       process's pool, so one left behind stays until the multiplexer
++       exits */
 +    if (!processor) {
 +        _DBG("server %s in child %d has no child_info associated",
 +                "(unknown)", my_child_num);
++        apr_pool_destroy(pool);
 +        return -1;
 +    }
 +
 +    /* ProcessorPassTimeout: it took nothing lately, don't wait for it */
 +    if (pass_blocked(processor)) {
++        apr_pool_destroy(pool);
 +        return -1;
 +    }
 +
 +    /* Make sure there are free workers on the other end */
 +    if (wait_for_workers(processor) == -1) {
++        apr_pool_destroy(pool);
 +        return -1;
 +    }
 +
@@ -1895,26 +2031,19 @@
 +    /* passing remote_addr too, see comments below */
 +    apr_socket_addr_get(&remote_addr, APR_REMOTE, thesock);
 +
-+    header_len = 0;
-+    body_len = 0;
-+
++    /* both lengths 0: the message ends after the address */
 +    iov[0].iov_base = &header_len;
 +    iov[0].iov_len = sizeof(header_len);
 +    iov[1].iov_base = &body_len;
 +    iov[1].iov_len = sizeof(body_len);
 +    iov[2].iov_base = remote_addr;
 +    iov[2].iov_len = sizeof(*remote_addr);
-+    iov[3].iov_base = h.headers;
-+    iov[3].iov_len = 0;
-+    iov[4].iov_base = body;
-+    iov[4].iov_len = body_len;
 +
-+    msg.msg_name = NULL;
-+    msg.msg_namelen = 0;
++    memset(&msg, 0, sizeof(msg));
 +    msg.msg_iov = iov;
-+    msg.msg_iovlen = 5;
++    msg.msg_iovlen = 3;
 +
-+    cmsg = apr_palloc(pool, sizeof(*cmsg) + sizeof(sock_fd));
++    cmsg = apr_pcalloc(pool, CMSG_SPACE(sizeof(sock_fd)));
 +    cmsg->cmsg_len = CMSG_LEN(sizeof(sock_fd));
 +    cmsg->cmsg_level = SOL_SOCKET;
 +    cmsg->cmsg_type = SCM_RIGHTS;
@@ -1928,13 +2057,11 @@
 +
 +    _DBG("Writing message to %d, passing sock_fd:  %d", processor->senv->output,
 +         sock_fd);
-+    _DBG("header_len=%d headers=\"%s\"", header_len, h.headers);
-+    _DBG("body_len=%d body=\"%s\"", body_len, body);
 +
 +    if ((rv = send_to_processor(processor, &msg)) == -1) {
-+        apr_pool_destroy(pool);
 +        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, ap_server_conf,
 +                     "Writing message failed %d %d", rv, errno);
++        apr_pool_destroy(pool);
 +        return -1;
 +    }
 +
@@ -2185,11 +2312,11 @@
 +            if (apr_brigade_pflatten(body_bb, &body, &body_len, r->pool)
 +                != APR_SUCCESS) {
 +
++                /* r stays as it is: the caller answers 503 with it */
 +                ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, ap_server_conf,
 +                             "Unable to flatten brigade, declining request");
 +
-+                apr_pool_destroy(r->pool);
-+                return DECLINED;
++                return -1;
 +            }
 +
 +            _DBG("Brigade is flattened as body (body_len=%d)", body_len);
@@ -2226,8 +2353,21 @@
 +
 +    header_len = strlen(h.headers);
 +
-+    if (header_len > PERUSER_MAX_HEADER_SIZE) {
-+        _DBG("Header too big (header_len=%d)", header_len);
++    /* What the receiver's buffer holds (see PERUSER_MAX_PASS_DATA): the
++       headers, and the headers with the body that came along. Answered with
++       413; r is left alone for that. */
++    if (header_len > PERUSER_MAX_HEADER_SIZE
++        || header_len + 1 + body_len > PERUSER_MAX_PASS_DATA) {
++        ap_log_error(APLOG_MARK, APLOG_INFO, 0, ap_server_conf,
++                     "Request for %s is too large to pass to processor %s "
++                     "(headers %lu bytes, at most %d; with the first part "
++                     "of the body %lu, at most %d)",
++                     r->hostname ? r->hostname : "(no host)",
++                     child->senv ? child->senv->name : "?",
++                     (unsigned long) header_len,
++                     PERUSER_MAX_HEADER_SIZE,
++                     (unsigned long) (header_len + 1 + body_len),
++                     PERUSER_MAX_PASS_DATA);
 +        return -2;
 +    }
 +
@@ -2238,16 +2378,15 @@
 +    iov[2].iov_base = remote_addr;
 +    iov[2].iov_len = sizeof(*remote_addr);
 +    iov[3].iov_base = h.headers;
-+    iov[3].iov_len = strlen(h.headers) + 1;
++    iov[3].iov_len = header_len + 1;
 +    iov[4].iov_base = body;
 +    iov[4].iov_len = body_len;
 +
-+    msg.msg_name = NULL;
-+    msg.msg_namelen = 0;
++    memset(&msg, 0, sizeof(msg));
 +    msg.msg_iov = iov;
 +    msg.msg_iovlen = 5;
 +
-+    cmsg = apr_palloc(r->pool, sizeof(*cmsg) + sizeof(sock_fd));
++    cmsg = apr_pcalloc(r->pool, CMSG_SPACE(sizeof(sock_fd)));
 +    cmsg->cmsg_len = CMSG_LEN(sizeof(sock_fd));
 +    cmsg->cmsg_level = SOL_SOCKET;
 +    cmsg->cmsg_type = SCM_RIGHTS;
@@ -2265,7 +2404,9 @@
 +    _DBG("body_len=%d body=\"%s\"", body_len, body);
 +
 +    if ((rv = send_to_processor(child, &msg)) == -1) {
-+        apr_pool_destroy(r->pool);
++        /* Not passed: the request is still ours, and the caller answers it
++           with 503 through r. Destroying r->pool here (as this did) left
++           httpd writing that answer from freed memory. */
 +        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, ap_server_conf,
 +                     "Writing message failed %d %d", rv, errno);
 +        return -1;
@@ -2277,8 +2418,28 @@
 +    _DBG("closing socket %d on our side", sock_fd);
 +    apr_socket_close(thesock);
 +
++    /* Passed: the request is the processor's now. The caller touches r no
++       more and longjmp()s back to the accept loop. */
 +    apr_pool_destroy(r->pool);
 +    return 1;
++}
++
++/* receive_connection() got something that isn't a whole hand-off message.
++   Only a process holding the processor's socket can have written it; the
++   stream can't be trusted from here on, so this child goes (APR_EGENERAL),
++   as it does when recvmsg() fails. */
++static apr_status_t receive_refused(const char *why, long got, int fd)
++{
++    if (fd >= 0) {
++        close(fd);
++    }
++    ap_log_error(APLOG_MARK, APLOG_ERR, 0, ap_server_conf,
++                 "peruser: child %d (%s): hand-off message refused: %s "
++                 "(%ld bytes received); this child exits", my_child_num,
++                 CHILD_INFO_TABLE[my_child_num].senv
++                     ? CHILD_INFO_TABLE[my_child_num].senv->name : "?",
++                 why, got);
++    return APR_EGENERAL;
 +}
 +
 +static apr_status_t receive_connection(void **trans_sock,
@@ -2287,41 +2448,48 @@
 +{
 +    struct msghdr msg;
 +    struct cmsghdr *cmsg;
-+    char buff[PERUSER_MAX_HEADER_SIZE] = "";
-+    char headers[PERUSER_MAX_HEADER_SIZE] = "";
-+    char *body = "";
-+    apr_size_t header_len, body_len;
++    union {
++        struct cmsghdr align;
++        char space[CMSG_SPACE(sizeof(apr_os_sock_t))];
++    } control;
++    /* headers + NUL + body of one message; only the bytes recvmsg() filled
++       in are looked at */
++    char buff[PERUSER_MAX_PASS_DATA];
++    apr_size_t header_len = 0, body_len = 0;
++    apr_size_t data_len;
 +    struct iovec iov[4];
-+    int ret, fd_tmp;
++    ssize_t ret;
++    int fd_tmp;
 +    apr_os_sock_t ctrl_sock_fd;
-+    apr_os_sock_t trans_sock_fd;
++    apr_os_sock_t trans_sock_fd = -1;
 +    apr_sockaddr_t remote_addr;
 +    apr_os_sock_info_t sockinfo;
++    apr_status_t rv;
 +
 +    /* -- bucket's, brigades and their allocators */
-+    apr_bucket_alloc_t *alloc = apr_bucket_alloc_create(ptrans);
-+    apr_bucket_brigade *bb = apr_brigade_create(ptrans, alloc);
++    apr_bucket_alloc_t *alloc;
++    apr_bucket_brigade *bb;
 +    apr_bucket *bucket;
 +
 +    /* prepare the buffers for receiving data from remote side */
++    memset(&remote_addr, 0, sizeof(remote_addr));
 +    iov[0].iov_base = &header_len;
 +    iov[0].iov_len = sizeof(header_len);
 +    iov[1].iov_base = &body_len;
 +    iov[1].iov_len = sizeof(body_len);
 +    iov[2].iov_base = &remote_addr;
 +    iov[2].iov_len = sizeof(remote_addr);
-+    iov[3].iov_base = (char*) &buff;
-+    iov[3].iov_len = PERUSER_MAX_HEADER_SIZE;
++    iov[3].iov_base = buff;
++    iov[3].iov_len = sizeof(buff);
 +
-+    cmsg = apr_palloc(ptrans, sizeof(*cmsg) + sizeof(trans_sock_fd));
-+    cmsg->cmsg_len = CMSG_LEN(sizeof(trans_sock_fd));
-+
-+    msg.msg_name = NULL;
-+    msg.msg_namelen = 0;
++    /* room for exactly one descriptor: with more in the message the kernel
++       hands over one and sets MSG_CTRUNC */
++    memset(&control, 0, sizeof(control));
++    memset(&msg, 0, sizeof(msg));
 +    msg.msg_iov = iov;
 +    msg.msg_iovlen = 4;
-+    msg.msg_control = cmsg;
-+    msg.msg_controllen = cmsg->cmsg_len;
++    msg.msg_control = control.space;
++    msg.msg_controllen = CMSG_LEN(sizeof(trans_sock_fd));
 +
 +    /* -- receive data from socket -- */
 +    apr_os_sock_get(&ctrl_sock_fd, lr->sd);
@@ -2330,7 +2498,8 @@
 +    // Don't block
 +    ret = recvmsg(ctrl_sock_fd, &msg, MSG_DONTWAIT);
 +
-+    if (ret == -1 && errno == EAGAIN) {
++    if (ret == -1 && (errno == EAGAIN || errno == EWOULDBLOCK
++                      || errno == EINTR)) {
 +        _DBG("receive_from_multiplexer recvmsg() EAGAIN, someone was faster");
 +
 +        return APR_EAGAIN;
@@ -2345,49 +2514,107 @@
 +        _DBG("recvmsg returned %d", ret);
 +
 +    /* -- extract socket from the cmsg -- */
-+    memcpy(&trans_sock_fd, CMSG_DATA(cmsg), sizeof(trans_sock_fd));
++    /* First of all, so that it's closed whatever else is wrong. */
++    cmsg = CMSG_FIRSTHDR(&msg);
++    if (cmsg != NULL && cmsg->cmsg_level == SOL_SOCKET
++        && cmsg->cmsg_type == SCM_RIGHTS
++        && cmsg->cmsg_len == CMSG_LEN(sizeof(trans_sock_fd))) {
++        memcpy(&trans_sock_fd, CMSG_DATA(cmsg), sizeof(trans_sock_fd));
++    }
++
++    /* Nothing below is taken on trust: the lengths come out of the stream,
++       and what they describe has to be exactly what was received. */
++    if (ret == 0) {
++        return receive_refused("the socket was closed", 0, trans_sock_fd);
++    }
++    if (msg.msg_flags & MSG_CTRUNC) {
++        return receive_refused("its descriptor didn't arrive whole (out of "
++                               "file descriptors, or more than one sent)",
++                               (long) ret, trans_sock_fd);
++    }
++    if ((apr_size_t) ret < PERUSER_PASS_FIXED) {
++        return receive_refused("shorter than a message's fixed part",
++                               (long) ret, trans_sock_fd);
++    }
++    data_len = (apr_size_t) ret - PERUSER_PASS_FIXED;
++    if (header_len > PERUSER_MAX_HEADER_SIZE
++        || body_len > PERUSER_MAX_PASS_DATA) {
++        return receive_refused("a length field is out of range", (long) ret,
++                               trans_sock_fd);
++    }
++    if (header_len == 0
++            ? (body_len != 0 || data_len != 0)
++            : (header_len + 1 + body_len != data_len
++               || buff[header_len] != '\0')) {
++        return receive_refused("its lengths don't add up to what was "
++                               "received", (long) ret, trans_sock_fd);
++    }
++    if (trans_sock_fd < 0) {
++        return receive_refused("no descriptor with it", (long) ret, -1);
++    }
++    if (remote_addr.family != APR_INET
++#if APR_HAVE_IPV6
++        && remote_addr.family != APR_INET6
++#endif
++        ) {
++        return receive_refused("unknown address family", (long) ret,
++                               trans_sock_fd);
++    }
++    if (remote_addr.sa.sin.sin_family != remote_addr.family) {
++        return receive_refused("address families disagree", (long) ret,
++                               trans_sock_fd);
++    }
 +
 +    /* here *trans_sock always == NULL (socket reset at got_fd), so
 +     we can use apr_os_sock_make() instead of apr_os_sock_put() */
 +
++    /* Of the sender's apr_sockaddr_t only the family and the address bytes
++       are used; its pointers mean nothing in this process, and
++       apr_os_sock_make() sets its own from the family. */
++    memset(&sockinfo, 0, sizeof(sockinfo));
 +    sockinfo.os_sock = &trans_sock_fd;
 +    sockinfo.local = NULL;
 +    sockinfo.remote = (struct sockaddr *) &remote_addr.sa.sin;
 +    sockinfo.family = remote_addr.family;
 +    sockinfo.type = SOCK_STREAM;
-+#ifdef APR_ENABLE_FOR_1_0
-+    sockinfo.protocol = 0;
-+#endif
-+    apr_os_sock_make((apr_socket_t **) trans_sock, &sockinfo, ptrans);
++    rv = apr_os_sock_make((apr_socket_t **) trans_sock, &sockinfo, ptrans);
++    if (rv != APR_SUCCESS || *trans_sock == NULL) {
++        *trans_sock = NULL;
++        return receive_refused("apr_os_sock_make() failed", (long) ret,
++                               trans_sock_fd);
++    }
 +    apr_os_sock_get(&fd_tmp, *trans_sock);
 +
 +    _DBG("trans_sock=%ld fdx=%d sock_fd=%d",
 +            *trans_sock, trans_sock_fd, fd_tmp);
 +
-+    apr_cpystrn(headers, buff, header_len + 1);
-+    _DBG("header_len=%d headers=\"%s\"", header_len, headers);
++    _DBG("header_len=%d", header_len);
 +
 +    if (header_len) {
 +        _DBG("header_len > 0, we got a request");
 +        /* -- store received data into an brigade and add
 +         it to the current transaction's pool -- */
++        alloc = apr_bucket_alloc_create(ptrans);
++        bb = apr_brigade_create(ptrans, alloc);
++
 +        bucket = apr_bucket_eos_create(alloc);
 +        APR_BRIGADE_INSERT_HEAD(bb, bucket);
 +        bucket = apr_bucket_socket_create(*trans_sock, alloc);
 +        APR_BRIGADE_INSERT_HEAD(bb, bucket);
 +
 +        if (body_len) {
-+            body = (char*) &buff[header_len + 1];
-+            _DBG("body_len=%d", strlen(body));
++            _DBG("body_len=%d", body_len);
 +
-+            bucket = apr_bucket_heap_create(body, body_len, NULL, alloc);
++            /* the heap bucket copies it out of buff */
++            bucket = apr_bucket_heap_create(buff + header_len + 1, body_len,
++                                            NULL, alloc);
 +            APR_BRIGADE_INSERT_HEAD(bb, bucket);
 +        }
 +        else {
 +            _DBG("There is no body");
 +        }
 +
-+        bucket = apr_bucket_heap_create(headers, header_len, NULL, alloc);
++        bucket = apr_bucket_heap_create(buff, header_len, NULL, alloc);
 +
 +        APR_BRIGADE_INSERT_HEAD(bb, bucket);
 +        apr_pool_userdata_set(bb, "PERUSER_SOCKETS", NULL, ptrans);
@@ -2620,33 +2847,6 @@
 +    return 0;
 +}
 +
-+static int check_signal(int signum)
-+{
-+    _DBG("signum=%d", signum);
-+
-+    switch (signum) {
-+    case SIGTERM:
-+    case SIGINT:
-+        just_die(signum);
-+        return 1;
-+    }
-+
-+    return 0;
-+}
-+
-+/* Send a single HTTP header field to the client.  Note that this function
-+ * is used in calls to table_do(), so their interfaces are co-dependent.
-+ * In other words, don't change this one without checking table_do in alloc.c.
-+ * It returns true unless there was a write error of some kind.
-+ */
-+static int peruser_header_field(peruser_header *h, const char *fieldname,
-+                                const char *fieldval)
-+{
-+    apr_pstrcat(h->p, h->headers, fieldname, ": ", fieldval, CRLF, NULL);
-+
-+    return 1;
-+}
-+
 +static inline ap_listen_rec* listen_add(apr_pool_t* pool, apr_socket_t *sock,
 +        void* accept_func)
 +{
@@ -2695,32 +2895,6 @@
 +    }
 +
 +    num_listensocks = 0;
-+}
-+
-+apr_status_t cleanup_child_info(void *d)
-+{
-+    if (child_info_image == NULL) {
-+        return APR_SUCCESS;
-+    }
-+
-+    free(child_info_image);
-+    child_info_image = NULL;
-+    apr_shm_destroy(child_info_shm);
-+
-+    return APR_SUCCESS;
-+}
-+
-+apr_status_t cleanup_server_environments(void *d)
-+{
-+    if (server_env_image == NULL) {
-+        return APR_SUCCESS;
-+    }
-+
-+    free(server_env_image);
-+    server_env_image = NULL;
-+    apr_shm_destroy(server_env_shm);
-+
-+    return APR_SUCCESS;
 +}
 +
 +static void child_main(int child_num_arg)
@@ -2909,7 +3083,7 @@
 +
 +        if (CHILD_INFO_TABLE[my_child_num].type != CHILD_TYPE_MULTIPLEXER
 +            && ap_max_requests_per_child > 0
-+            && requests_this_child++ >= ap_max_requests_per_child) {
++            && requests_this_child >= ap_max_requests_per_child) {
 +            _DBG("max requests reached, dying now");
 +#ifdef PERUSER_MAX_CPU_USAGE
 +            CHILD_INFO_TABLE[my_child_num].cpu_stopped = 0;
@@ -3010,6 +3184,11 @@
 +        else if (status != APR_SUCCESS || die_now || sock == NULL) {
 +            continue;
 +        }
++
++        /* MaxRequestsPerChild counts the connections this child got, not
++         * its wake-ups: every passed connection wakes all the processor's
++         * idle workers and one of them gets it. */
++        requests_this_child++;
 +
 +        if (CHILD_INFO_TABLE[my_child_num].status == CHILD_STATUS_READY) {
 +            CHILD_INFO_TABLE[my_child_num].status = CHILD_STATUS_ACTIVE;
@@ -3125,8 +3304,8 @@
 +            || (senv->name == NULL && SENV[i].uid == senv->uid
 +                && SENV[i].gid == senv->gid
 +                && ((SENV[i].chroot == NULL && senv->chroot == NULL)
-+                    || ((SENV[i].chroot != NULL || senv->chroot != NULL)
-+                    && !strcmp(SENV[i].chroot, senv->chroot))))) {
++                    || (SENV[i].chroot != NULL && senv->chroot != NULL
++                        && !strcmp(SENV[i].chroot, senv->chroot))))) {
 +            return &SENV[i];
 +        }
 +    }
@@ -3158,14 +3337,24 @@
 +
 +    _DBG("Creating new senv");
 +
++    if (socketpair(PF_UNIX, SOCK_STREAM, 0, socks) != 0) {
++        ap_log_error(APLOG_MARK, APLOG_STARTUP | APLOG_CRIT, errno, NULL,
++                     "peruser: socketpair() failed for processor %s",
++                     senv->name ? senv->name : "(unnamed)");
++        return NULL;
++    }
++
 +    memcpy(&SENV[NUM_SENV], senv, sizeof(server_env_t));
 +
 +    SENV[NUM_SENV].availability = 100;
 +    SENV[NUM_SENV].pass_blocked_until = 0;
++    SENV[NUM_SENV].start_blocked_until = 0;
 +
-+    socketpair(PF_UNIX, SOCK_STREAM, 0, socks);
 +    SENV[NUM_SENV].input = socks[0];
 +    SENV[NUM_SENV].output = socks[1];
++    /* the parent's own note of the pair, at 2 * id and 2 * id + 1 */
++    APR_ARRAY_PUSH(parent_socks, int) = socks[0];
++    APR_ARRAY_PUSH(parent_socks, int) = socks[1];
 +
 +    _DBG("New senv id %d", NUM_SENV);
 +    SENV[NUM_SENV].id = NUM_SENV;
@@ -3258,8 +3447,9 @@
 +    if (CHILD_INFO_TABLE[i].senv == NULL) {
 +        // Changing back to UNKNOWN type
 +        CHILD_INFO_TABLE[i].type = CHILD_TYPE_UNKNOWN;
-+        return "Trying to use more server environments than ServerLimit.  "
-+            "Increase ServerLimit in your config file.";
++        return "Could not add a server environment: more of them than "
++            "ServerLimit (increase ServerLimit in your config file), or "
++            "no socket pair for it (see the message above).";
 +    }
 +
 +    if (type == CHILD_TYPE_MULTIPLEXER) {
@@ -3388,6 +3578,9 @@
 +    sigprocmask(SIG_SETMASK, &parent_mask, NULL);
 +
 +    ap_scoreboard_image->parent[slot].pid = pid;
++    ap_scoreboard_image->parent[slot].generation = ap_my_generation;
++    ap_run_child_status(ap_server_conf, pid, ap_my_generation, slot,
++                        MPM_CHILD_STARTED);
 +    CHILD_INFO_TABLE[slot].pid = pid;
 +    CHILD_INFO_TABLE[slot].senv->active_processors++;
 +#ifdef PERUSER_MAX_CPU_USAGE
@@ -3545,8 +3738,11 @@
 +
 +    for (i = 0; i < 50; ++i) {
 +        if (child_info_image->control->new) {
-+            create_new_childs();
++            /* cleared before the scan: a request to start a child that
++             * arrives during it is then seen on the next round, not lost
++             * until the next maintenance pass */
 +            child_info_image->control->new = 0;
++            create_new_childs();
 +        }
 +        apr_sleep(SCOREBOARD_MAINTENANCE_INTERVAL / 50);
 +    }
@@ -3692,6 +3888,115 @@
 +
 +}
 +
++/* Takes what is queued for a processor off its socket and closes the
++ * visitors' connections in it. Used when the processor has no child left
++ * to read them and none can be started: otherwise those visitors would wait
++ * until the proxy in front gives up. Parent only.
++ */
++static void drain_processor_queue(server_env_t *senv)
++{
++    static char buf[PERUSER_PASS_FIXED + PERUSER_MAX_PASS_DATA];
++    union {
++        struct cmsghdr align;
++        char space[CMSG_SPACE(8 * sizeof(int))];
++    } ctl;
++    long id = (long) (senv - SENV);
++    int sock, closed = 0, rounds;
++
++    if (parent_socks == NULL || id < 0 || 2 * id + 1 >= parent_socks->nelts) {
++        return;
++    }
++    sock = APR_ARRAY_IDX(parent_socks, 2 * id, int);
++
++    for (rounds = 0; rounds < 10000; rounds++) {
++        struct msghdr msg;
++        struct iovec iov;
++        struct cmsghdr *cmsg;
++        ssize_t got;
++
++        memset(&msg, 0, sizeof(msg));
++        iov.iov_base = buf;
++        iov.iov_len = sizeof(buf);
++        msg.msg_iov = &iov;
++        msg.msg_iovlen = 1;
++        msg.msg_control = ctl.space;
++        msg.msg_controllen = sizeof(ctl.space);
++
++        got = recvmsg(sock, &msg, MSG_DONTWAIT);
++        if (got < 0 && errno == EINTR) {
++            continue;
++        }
++        if (got <= 0) {
++            break;
++        }
++        for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL;
++             cmsg = CMSG_NXTHDR(&msg, cmsg)) {
++            if (cmsg->cmsg_level == SOL_SOCKET
++                && cmsg->cmsg_type == SCM_RIGHTS
++                && cmsg->cmsg_len >= CMSG_LEN(sizeof(int))) {
++                size_t n = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
++                size_t k;
++
++                for (k = 0; k < n; k++) {
++                    int fd;
++
++                    memcpy(&fd, CMSG_DATA(cmsg) + k * sizeof(int),
++                           sizeof(fd));
++                    close(fd);
++                    closed++;
++                }
++            }
++        }
++    }
++
++    if (closed) {
++        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, ap_server_conf,
++                     "peruser: processor %s: closed %d waiting "
++                     "connection(s), no child to serve them",
++                     senv->name ? senv->name : "(unnamed)", closed);
++    }
++}
++
++/* A processor's or worker's child ended with APEXIT_CHILDFATAL: it could
++ * not be set up (setuid, setgid, chroot, cgroup, a module's child_init).
++ * Up to .8 that stopped the whole server, so one tenant's broken account
++ * took every site down. Now only that processor is affected: no replacement
++ * is forked, its requests get a 503 for PERUSER_START_BLOCK_SECS, then the
++ * next request tries once more. Parent only.
++ */
++static void processor_start_failed(int slot, pid_t pid)
++{
++    child_info_t *child = &CHILD_INFO_TABLE[slot];
++    server_env_t *senv = child->senv;
++    int i;
++
++    ap_log_error(APLOG_MARK, APLOG_ERR, 0, ap_server_conf,
++                 "peruser: a child of processor %s could not start "
++                 "(pid %ld, see its message above). The server keeps "
++                 "running; this processor's requests get a 503 for %d s, "
++                 "then it is tried again.",
++                 senv->name ? senv->name : "(unnamed)", (long) pid,
++                 PERUSER_START_BLOCK_SECS);
++
++    senv->start_blocked_until = apr_time_now()
++                                + apr_time_from_sec(PERUSER_START_BLOCK_SECS);
++
++    if (child->type == CHILD_TYPE_WORKER) {
++        /* completely free up this slot */
++        child->senv = (server_env_t*) NULL;
++        child->type = CHILD_TYPE_UNKNOWN;
++        child->sock_fd = -3; /* -1 and -2 are taken */
++    }
++    child->status = CHILD_STATUS_STANDBY;
++
++    for (i = 0; i < NUM_CHILDS; ++i) {
++        if (CHILD_INFO_TABLE[i].senv == senv && CHILD_INFO_TABLE[i].pid > 0) {
++            return; /* a sibling is alive and reads the queue */
++        }
++    }
++    drain_processor_queue(senv);
++}
++
 +/*****************************************************************
 + * Executive routines.
 + */
@@ -3724,14 +4029,6 @@
 +    /*    apr_socket_t *sock = NULL; */
 +
 +    ap_log_pid(pconf, ap_pid_fname);
-+
-+    first_server_limit = server_limit;
-+    if (changed_limit_at_restart) {
-+        ap_log_error(APLOG_MARK, APLOG_WARNING, 0, s,
-+                     "WARNING: Attempt to change ServerLimit "
-+                     "ignored during restart");
-+        changed_limit_at_restart = 0;
-+    }
 +
 +    ap_server_conf = s;
 +
@@ -3810,13 +4107,12 @@
 +         * extra child
 +         */
 +        if (pid.pid != -1) {
-+            processed_status = ap_process_child_status(&pid, exitwhy, status);
-+            if (processed_status == APEXIT_CHILDFATAL) {
-+                mpm_state = AP_MPMQ_STOPPING;
-+                return 1;
-+            }
++            ap_generation_t old_gen = 0;
++            int tenant_fatal = 0;
 +
-+            /* non-fatal death... note that it's gone in the scoreboard. */
++            processed_status = ap_process_child_status(&pid, exitwhy, status);
++
++            /* whose was it? */
 +            for (i = 0; i < NUM_CHILDS; ++i) {
 +                if (CHILD_INFO_TABLE[i].pid == pid.pid) {
 +                    child_slot = i;
@@ -3826,7 +4122,39 @@
 +
 +            _DBG("child #%d (pid=%d) has died", child_slot, pid.pid);
 +
++            if (processed_status == APEXIT_CHILDFATAL) {
++                if (child_slot >= 0
++                    && CHILD_INFO_TABLE[child_slot].type
++                           != CHILD_TYPE_MULTIPLEXER
++                    && CHILD_INFO_TABLE[child_slot].senv != NULL) {
++                    /* one tenant's processor: the others go on */
++                    tenant_fatal = 1;
++                }
++                else if (child_slot < 0
++                         && ap_unregister_extra_mpm_process(pid.pid,
++                                                            &old_gen) == 1) {
++                    peruser_note_child_killed(-1, pid.pid, old_gen);
++                    ap_log_error(APLOG_MARK, APLOG_WARNING, 0, ap_server_conf,
++                                 "Ignoring fatal error in child of previous "
++                                 "generation (pid %ld).", (long) pid.pid);
++                    continue;
++                }
++                else {
++                    /* A multiplexer, or a process we have no record of: the
++                     * server can't go on. Stop the normal way (children
++                     * signalled and reaped, pid file removed) instead of
++                     * returning at once and leaving them behind. */
++                    child_fatal = 1;
++                    fatal_pid = pid.pid;
++                    shutdown_pending = 1;
++                }
++            }
++
 +            if (child_slot >= 0) {
++                ap_run_child_status(ap_server_conf, pid.pid,
++                        ap_scoreboard_image->parent[child_slot].generation,
++                        child_slot, MPM_CHILD_EXITED);
++                ap_scoreboard_image->parent[child_slot].pid = 0;
 +                CHILD_INFO_TABLE[child_slot].pid = 0;
 +
 +                status = ap_scoreboard_image->servers[child_slot][0].status;
@@ -3839,7 +4167,13 @@
 +
 +                _TRACE_RET("ap_update_child_status_from_indexes");
 +
-+                if (processed_status == APEXIT_CHILDSICK) {
++                if (child_fatal) {
++                    /* stopping: nothing is replaced */
++                }
++                else if (tenant_fatal) {
++                    processor_start_failed(child_slot, pid.pid);
++                }
++                else if (processed_status == APEXIT_CHILDSICK) {
 +                    /* child detected a resource shortage (E[NM]FILE, ENOBUFS,
 +                     * etc)
 +                     * cut the fork rate to the minimum 
@@ -3875,6 +4209,13 @@
 +                    _DBG("replacing by new child ...");
 +                    make_child(ap_server_conf, child_slot);
 +                }
++            }
++            else if (!child_fatal
++                     && ap_unregister_extra_mpm_process(pid.pid,
++                                                        &old_gen) == 1) {
++                /* a child of a previous generation, finishing after a
++                 * graceful restart (up to .8: "long lost child came home") */
++                peruser_note_child_killed(-1, pid.pid, old_gen);
 +#if APR_HAS_OTHER_CHILD
 +            }
 +            else if (apr_proc_other_child_alert(&pid, APR_OC_REASON_DEATH,
@@ -3925,6 +4266,9 @@
 +         */
 +
 +        int n = 0;
++        /* taken now: the killpg() below reaches this process too, as SIGTERM */
++        int stop_signal = shutdown_signal;
++
 +        for (n = 0; n < NUM_CHILDS; ++n) {
 +            if (ap_scoreboard_image->servers[n][0].status != SERVER_DEAD &&
 +                ap_scoreboard_image->parent[n].pid) {
@@ -3943,6 +4287,8 @@
 +            ap_log_error(APLOG_MARK, APLOG_WARNING, errno, ap_server_conf,
 +                         "killpg SIGTERM");
 +        }
++        /* also ends what is left of earlier generations (registered at the
++         * graceful restart): up to .8 those were left running */
 +        ap_reclaim_child_processes(1, /* Start with SIGTERM */
 +                                   peruser_note_child_killed);
 +
@@ -3956,9 +4302,29 @@
 +                             (long) getpid());
 +        }
 +
-+        ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, ap_server_conf,
-+                     "caught SIGTERM, shutting down");
-+        return 1;
++        if (child_fatal) {
++            ap_log_error(APLOG_MARK, APLOG_ALERT, 0, ap_server_conf,
++                         "peruser: fatal error in a child the server can't "
++                         "run without (pid %ld), shut down",
++                         (long) fatal_pid);
++        }
++        else {
++            ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, ap_server_conf,
++                         "caught %s, shutting down",
++#ifdef AP_SIG_GRACEFUL_STOP
++                         stop_signal == AP_SIG_GRACEFUL_STOP
++                             ? AP_SIG_GRACEFUL_STOP_STRING :
++#endif
++#ifdef SIGINT
++                         stop_signal == SIGINT ? "SIGINT" :
++#endif
++                         "SIGTERM");
++        }
++
++        /* A requested stop is not a failure: main() exits 0 on DONE and
++         * logs "AH02818: MPM run failed, exiting" on anything else. A stop
++         * after a fatal error in a child stays one. */
++        return child_fatal ? !OK : DONE;
 +    }
 +
 +    /* we've been told to restart */
@@ -3973,13 +4339,11 @@
 +     * use by any of the children.
 +     */
 +    ++ap_my_generation;
++    retained->generation = ap_my_generation; /* the statics don't survive */
 +    ap_scoreboard_image->global->running_generation = ap_my_generation;
 +
 +    /* cleanup sockets */
-+    for (i = 0; i < NUM_SENV; i++) {
-+        close(SENV[i].input);
-+        close(SENV[i].output);
-+    }
++    close_parent_sockets(NULL);
 +
 +    if (is_graceful) {
 +        char char_of_death = AP_PERUSER_CHAR_OF_DEATH;
@@ -3992,9 +4356,20 @@
 +         * in a very nasty way if we ever have the scoreboard totally
 +         * file-based (no shared memory)
 +         */
-+        for (i = 0; i < ap_daemons_limit; ++i) {
++        for (i = 0; i < NUM_CHILDS; ++i) {
 +            if (ap_scoreboard_image->servers[i][0].status != SERVER_DEAD) {
 +                ap_scoreboard_image->servers[i][0].status = SERVER_GRACEFUL;
++            }
++        }
++
++        /* The next generation gets new tables and a cleared scoreboard, so
++         * hand the children that finish their requests to the core's list:
++         * it is how they are recognised when they exit, and how they are
++         * ended if the server stops first. */
++        for (i = 0; i < NUM_CHILDS; ++i) {
++            if (CHILD_INFO_TABLE[i].pid > 0) {
++                ap_register_extra_mpm_process(CHILD_INFO_TABLE[i].pid,
++                        ap_scoreboard_image->parent[i].generation);
 +            }
 +        }
 +
@@ -4101,7 +4476,23 @@
 +    return OK;
 +}
 +
-+static int restart_num = 0;
++/* Closes the parent's ends of the processors' socket pairs. Runs when the
++ * configuration pool is cleared (so also after the first of the two startup
++ * passes, whose pairs used to stay open for good) and at a restart. */
++static apr_status_t close_parent_sockets(void *unused)
++{
++    int i;
++
++    if (parent_socks == NULL || getpid() != parent_pid) {
++        return APR_SUCCESS;
++    }
++    for (i = 0; i < parent_socks->nelts; i++) {
++        close(APR_ARRAY_IDX(parent_socks, i, int));
++    }
++    apr_array_clear(parent_socks);
++    return APR_SUCCESS;
++}
++
 +static int peruser_pre_config(apr_pool_t *p, apr_pool_t *plog,
 +        apr_pool_t *ptemp)
 +{
@@ -4111,8 +4502,15 @@
 +    apr_status_t rv;
 +    apr_pool_t *global_pool;
 +    void *shmem;
++    const char *userdata_key = "mpm_peruser_module";
 +
 +    mpm_state = AP_MPMQ_STARTING;
++
++    retained = ap_retained_data_get(userdata_key);
++    if (!retained) {
++        retained = ap_retained_data_create(userdata_key, sizeof(*retained));
++    }
++    ++retained->module_loads;
 +
 +    debug = ap_exists_config_define("DEBUG");
 +
@@ -4127,7 +4525,7 @@
 +    }
 +
 +    /* sigh, want this only the second time around */
-+    if (restart_num++ == 1) {
++    if (retained->module_loads == 2) {
 +        if (!one_process && !foreground) {
 +            rv = apr_proc_detach(no_detach ? APR_PROC_DETACH_FOREGROUND
 +                    : APR_PROC_DETACH_DAEMONIZE);
@@ -4138,9 +4536,21 @@
 +                return HTTP_INTERNAL_SERVER_ERROR;
 +            }
 +        }
-+
-+        parent_pid = ap_my_pid = getpid();
 +    }
++
++    parent_pid = ap_my_pid = getpid();
++    ap_my_generation = retained->generation;
++
++    /* ServerLimit is fixed after the first start (peruser_check_config()) */
++    if (retained->first_server_limit) {
++        server_limit = retained->first_server_limit;
++    }
++    changed_limit_at_restart = 0;
++    max_clients_configured = 0;
++
++    parent_socks = apr_array_make(p, 64, sizeof(int));
++    apr_pool_cleanup_register(p, NULL, close_parent_sockets,
++                              apr_pool_cleanup_null);
 +
 +    ap_mutex_register(p, AP_ACCEPT_MUTEX_TYPE, NULL, APR_LOCK_DEFAULT, 0);
 +    ap_listen_pre_config();
@@ -4187,20 +4597,31 @@
 +        }
 +    }
 +
-+    /* We don't want to have to recreate the scoreboard after
-+     * restarts, so we'll create a global pool and never clean it.
++    if (tmp_server_limit < server_limit) {
++        tmp_server_limit = server_limit;
++    }
++
++    /* The two shared tables are made anew on every load, in a pool of their
++     * own. The previous load's are released here: only the parent's mapping
++     * goes, the children of the previous generation keep theirs until they
++     * exit. Up to .8 each restart left both segments mapped for good.
 +     */
++    if (retained->tables_pool) {
++        apr_pool_destroy(retained->tables_pool);
++        retained->tables_pool = NULL;
++    }
 +    rv = apr_pool_create(&global_pool, NULL);
 +    if (rv != APR_SUCCESS) {
 +        ap_log_error(APLOG_MARK, APLOG_CRIT, rv, NULL,
 +                     "Fatal error: unable to create global pool");
 +        return rv;
 +    }
++    retained->tables_pool = global_pool;
 +
 +    if (!child_info_image) {
 +        _DBG("Initializing child_info_table");
 +        child_info_size = tmp_server_limit * sizeof(child_info_t)
-+                          + sizeof(apr_size_t);
++                          + sizeof(child_info_control);
 +
 +        rv = apr_shm_create(&child_info_shm, child_info_size, NULL,
 +                            global_pool);
@@ -4248,7 +4669,7 @@
 +        _DBG("Initializing server_environments_table");
 +
 +        server_env_size = tmp_server_limit * sizeof(server_env_t)
-+                          + sizeof(apr_size_t);
++                          + sizeof(server_env_control);
 +
 +        rv = apr_shm_create(&server_env_shm, server_env_size, NULL,
 +                            global_pool);
@@ -4295,11 +4716,103 @@
 +    return OK;
 +}
 +
++/* Checks that need the whole configuration: the setters see one directive
++ * at a time, in the order of the file. */
++static int peruser_check_config(apr_pool_t *p, apr_pool_t *plog,
++                                apr_pool_t *ptemp, server_rec *s)
++{
++    int i;
++    /* the first pass still has the console; later ones log to the error log */
++    int startup = (retained->module_loads == 1);
++    int warn = APLOG_WARNING | (startup ? APLOG_STARTUP : 0);
++    server_rec *ls = startup ? NULL : s;
++
++    if (changed_limit_at_restart) {
++        ap_log_error(APLOG_MARK, warn, 0, ls,
++                     "peruser: changing ServerLimit to %d from original "
++                     "value of %d not allowed during restart",
++                     changed_limit_at_restart, retained->first_server_limit);
++    }
++    if (!retained->first_server_limit) {
++        retained->first_server_limit = server_limit;
++    }
++
++    /* The scoreboard has ServerLimit slots. A ServerLimit written after the
++     * Processor directives took effect too late for them. */
++    if (NUM_CHILDS > server_limit || NUM_SENV > server_limit) {
++        ap_log_error(APLOG_MARK, APLOG_CRIT | (startup ? APLOG_STARTUP : 0),
++                     0, ls,
++                     "peruser: ServerLimit %d is below the %d processes and "
++                     "%d environments configured. Raise it, and put it "
++                     "before the Processor, Multiplexer and "
++                     "ServerEnvironment directives.",
++                     server_limit, (int) NUM_CHILDS, (int) NUM_SENV);
++        return HTTP_INTERNAL_SERVER_ERROR;
++    }
++
++    /* MaxClients is compared with ServerLimit here, not where it is read:
++     * without the directive it stayed at the default 256, above a lower
++     * ServerLimit, and the loops it bounds ran off the scoreboard. */
++    if (!max_clients_configured) {
++        ap_daemons_limit = server_limit;
++    }
++    else if (ap_daemons_limit > server_limit) {
++        ap_log_error(APLOG_MARK, warn, 0, ls,
++                     "peruser: MaxClients of %d exceeds ServerLimit value of "
++                     "%d servers, lowering MaxClients to %d. To increase, "
++                     "please see the ServerLimit directive.",
++                     ap_daemons_limit, server_limit, server_limit);
++        ap_daemons_limit = server_limit;
++    }
++
++    /* The idle and expire rules read the scoreboard's last_used, which the
++     * core keeps only with ExtendedStatus On: with it off every worker
++     * looked idle for ever and was stopped within seconds. */
++    if (!ap_extended_status) {
++        ap_log_error(APLOG_MARK, warn, 0, ls,
++                     "peruser: ExtendedStatus Off is not supported "
++                     "(IdleTimeout and ExpireTimeout depend on it), "
++                     "keeping it On");
++        ap_extended_status = 1;
++    }
++
++    if (ap_max_free_processors > 0
++        && ap_max_free_processors < ap_min_free_processors + 3) {
++        ap_log_error(APLOG_MARK, warn, 0, ls,
++                     "peruser: MaxSpareProcessors %d is too close to "
++                     "MinSpareProcessors %d: a worker is started and another "
++                     "stopped on almost every request. Use 0, or at least "
++                     "MinSpareProcessors + 3.",
++                     ap_max_free_processors, ap_min_free_processors);
++    }
++    for (i = 0; i < NUM_SENV; i++) {
++        if (SENV[i].start_processors > SENV[i].max_processors) {
++            SENV[i].start_processors = SENV[i].max_processors;
++        }
++        if ((SENV[i].max_free_processors != ap_max_free_processors
++             || SENV[i].min_free_processors != ap_min_free_processors)
++            && SENV[i].max_free_processors > 0
++            && SENV[i].max_free_processors
++               < SENV[i].min_free_processors + 3) {
++            ap_log_error(APLOG_MARK, warn, 0, ls,
++                         "peruser: processor %s: MaxSpareProcessors %d is "
++                         "too close to MinSpareProcessors %d (use 0, or at "
++                         "least MinSpareProcessors + 3)",
++                         SENV[i].name, SENV[i].max_free_processors,
++                         SENV[i].min_free_processors);
++        }
++    }
++
++    return OK;
++}
++
 +static int peruser_post_config(apr_pool_t *p, apr_pool_t *plog,
 +        apr_pool_t *ptemp, server_rec *server_list)
 +{
 +    const char *r;
 +    server_env_t senv;
++
++    memset(&senv, 0, sizeof(senv));
 +
 +    /* Retrieve the function from mod_ssl for detecting SSL virtualhosts */
 +    /* SSL routing is disabled - ssl part changed too much in httpd 2.4 */
@@ -4418,7 +4931,8 @@
 +                r->hostname, r->the_request);
 +
 +        if (processor->id != my_child_num) {
-+            if (processor->status == CHILD_STATUS_STANDBY) {
++            if (processor->status == CHILD_STATUS_STANDBY
++                && !start_blocked(processor->senv)) {
 +
 +                _DBG("New processor %s started", processor->senv->name);
 +                // Only start N processors if this is the first processor being started
@@ -4539,8 +5053,11 @@
 +{
 +    _DBG("CMP %d %d", *(int *) a,*(int *) b);
 +
-+    return active_env_processors(*(int *) a)
-+            < active_env_processors(*(int *) b);
++    /* most active first; a real three-way result, which qsort() needs */
++    return (active_env_processors(*(int *) a)
++            < active_env_processors(*(int *) b))
++           - (active_env_processors(*(int *) a)
++              > active_env_processors(*(int *) b));
 +}
 +
 +static int peruser_status_hook(request_rec *r, int flags)
@@ -4672,6 +5189,7 @@
 +
 +    ap_hook_open_logs(peruser_open_logs, NULL, aszSucc, APR_HOOK_MIDDLE);
 +    ap_hook_pre_config(peruser_pre_config, NULL, NULL, APR_HOOK_MIDDLE);
++    ap_hook_check_config(peruser_check_config, NULL, NULL, APR_HOOK_MIDDLE);
 +    ap_hook_post_config(peruser_post_config, NULL, NULL, APR_HOOK_MIDDLE);
 +
 +    /* Both of these must be run absolutely first.  If this request isn't for
@@ -4711,6 +5229,7 @@
 +    senv->stats_requests = 0;
 +    senv->stats_dropped = 0;
 +    senv->pass_blocked_until = 0;
++    senv->start_blocked_until = 0;
 +    senv->total_processors = 0;
 +    senv->idle_processors = 0;
 +    senv->active_processors = 0;
@@ -5019,18 +5538,10 @@
 +    }
 +
 +    ap_daemons_limit = atoi(arg);
++    max_clients_configured = 1;
 +
-+    if (ap_daemons_limit > server_limit) {
-+        ap_log_error(APLOG_MARK, APLOG_STARTUP, 0, NULL,
-+                     "WARNING: MaxClients of %d exceeds ServerLimit value "
-+                     "of %d servers,", ap_daemons_limit, server_limit);
-+        ap_log_error(APLOG_MARK, APLOG_STARTUP, 0, NULL,
-+                     " lowering MaxClients to %d.  To increase, please "
-+                     "see the ServerLimit", server_limit);
-+        ap_log_error(APLOG_MARK, APLOG_STARTUP, 0, NULL, " directive.");
-+        ap_daemons_limit = server_limit;
-+    }
-+    else if (ap_daemons_limit < 1) {
++    /* compared with ServerLimit in peruser_check_config() */
++    if (ap_daemons_limit < 1) {
 +        ap_log_error(APLOG_MARK, APLOG_STARTUP, 0, NULL,
 +                     "WARNING: Require MaxClients > 0, setting to 1");
 +        ap_daemons_limit = 1;
@@ -5172,7 +5683,7 @@
 +    if (ap_check_cmd_context(cmd, NOT_IN_VIRTUALHOST) != NULL) {
 +        sconf = PERUSER_SERVER_CONF(cmd->server->module_config);
 +
-+        if (sconf != NULL) {
++        if (sconf->senv != NULL) {
 +            sconf->senv->max_free_processors = max_free_procs;
 +        } else {
 +            ap_log_error(APLOG_MARK, APLOG_STARTUP, 0, NULL,
@@ -5323,12 +5834,11 @@
 +    /* you cannot change ServerLimit across a restart; ignore
 +     * any such attempts
 +     */
-+    if (first_server_limit && tmp_server_limit != server_limit) {
-+        /* how do we log a message?  the error log is a bit bucket at this
-+         * point; we'll just have to set a flag so that ap_mpm_run()
-+         * logs a warning later
-+         */
-+        changed_limit_at_restart = 1;
++    if (retained && retained->first_server_limit) {
++        if (tmp_server_limit != retained->first_server_limit) {
++            /* logged by peruser_check_config() */
++            changed_limit_at_restart = tmp_server_limit;
++        }
 +        return NULL;
 +    }
 +
@@ -5410,6 +5920,14 @@
 +                         "WARNING: Require ProcessorWaitTimeout steps > 0,"
 +                         "setting to 1");
 +            steps_tmp = 1;
++        }
++        else if (steps_tmp > 100) {
++            /* availability is counted in percent: above 100 steps the step
++             * was 0 and the wait never ended */
++            ap_log_error(APLOG_MARK, APLOG_STARTUP, 0, NULL,
++                         "WARNING: Require ProcessorWaitTimeout steps <= 100,"
++                         " setting to 100");
++            steps_tmp = 100;
 +        }
 +
 +        processor_wait_steps = steps_tmp;

@@ -13,7 +13,7 @@
 Summary:              Apache HTTP Server
 Name:                 httpd
 Version:              2.4.62
-Release:              1%{?dist}.8.peruser.dc
+Release:              1%{?dist}.9.peruser.dc
 URL:                  https://httpd.apache.org/
 Source0:              https://www.apache.org/dist/httpd/httpd-%{version}.tar.bz2
 Source1:              https://www.apache.org/dist/httpd/httpd-%{version}.tar.bz2.asc
@@ -835,6 +835,20 @@ exit $rv
 %{_rpmconfigdir}/macros.d/macros.httpd
 
 %changelog
+* Mon Nov 16 2026 Janno Sannik <janno@kood.ee> - 2.4.62-1.9.peruser.dc
+- peruser: fixes from the security and stability review (README, "Review
+  hardening"). The hand-off message is bounded on both sides and a refused
+  one is dropped whole (a POST with ~18 KB of headers made the worker read
+  its body from outside the buffer); pass_request() no longer destroys the
+  request's pool before the 503 is written; a tenant's child that can't be
+  set up no longer stops the server; "apachectl graceful-stop" (SIGWINCH)
+  stops the server and a requested stop exits 0; the module's state survives
+  its reload (generation, ServerLimit, the tables' shared memory, daemonizing
+  without -DFOREGROUND); children of an earlier generation are tracked and
+  ended at stop; ServerLimit is checked against the tables and the scoreboard
+  at config time; ExtendedStatus Off is overridden; MaxRequestsPerChild counts
+  connections, not wake-ups; smaller config and start-up fixes.
+
 * Mon Nov 16 2026 Janno Sannik <janno@kood.ee> - 2.4.62-1.8.peruser.dc
 - peruser: a SIGTERM during a child's startup can no longer stop the server.
   just_die() ran clean_child_exit() (apr_pool_destroy(), exit()) inside the
