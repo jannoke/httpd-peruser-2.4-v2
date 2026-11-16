@@ -28,9 +28,23 @@ set `EL_VERSION`.
 │   ├── Dockerfile.devbuild           # Development build image (el9/el10 via BASE_IMAGE)
 │   ├── build-rpm-dev.sh              # In-container build script (dev loop)
 │   ├── dev-build-loop.sh             # Interactive dev build loop (see below)
-│   └── agent-build-loop.sh           # Non-interactive build script (agent use)
+│   ├── agent-build-loop.sh           # Non-interactive build script (agent use)
+│   ├── local-smoke-test.sh           # Install the RPMs, start/request/stop cycles
+│   ├── spare-kill-test.sh            # Regression: MaxSpareProcessors never stops a busy copy (.6)
+│   └── pass-timeout-test.sh          # Regression: a processor that takes nothing can't stop the server (.7)
 └── README.md                         # This file
 ```
+
+## Directives added in this fork
+
+- **`ProcessorPassTimeout <seconds>`** (`.7.peruser.dc`, default 5, server config): how long a
+  multiplexer waits to hand a request to a processor whose socket is full because no copy of it reads
+  (all hung). Then that processor's requests get a 503 at once for as long again, and the next one
+  after that tries again. The error log says `Processor X took no request for N s` once per stop and
+  `Processor X takes requests again` when it recovers. `0` waits forever, as before `.7`: there, on
+  2026-11-16, one hung tenant blocked every multiplexer in `sendmsg()` and no site on the server
+  answered. Messages over ~32 KB (very large headers) are still sent blocking, so the stream to the
+  processor never holds half a message. `pass-timeout-test.sh` shows the outage on `.6` and the fix.
 
 ---
 
