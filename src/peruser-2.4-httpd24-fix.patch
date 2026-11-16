@@ -465,7 +465,7 @@
 +#endif /* AP_MPM_DEFAULT_H */
 --- a/server/mpm/peruser/peruser.c
 +++ b/server/mpm/peruser/peruser.c
-@@ -0,0 +1,4758 @@
+@@ -0,0 +1,5033 @@
 +/* ====================================================================
 + * The Apache Software License, Version 1.1
 + *
@@ -549,6 +549,9 @@
 +#if APR_HAVE_SYS_TYPES_H
 +#include <sys/types.h>
 +#endif
++#include <errno.h>
++#include <poll.h>
++#include <sys/socket.h>
 +
 +#include "ap_config.h"
 +#include "httpd.h"
@@ -602,6 +605,7 @@
 +#include <setjmp.h>
 +
 +#include <signal.h>
++#include <pthread.h>
 +#include <sys/times.h>
 +#ifdef __linux__
 +#include <sys/prctl.h>
@@ -703,6 +707,14 @@
 +static int multiplexer_idle_timeout = DEFAULT_MULTIPLEXER_IDLE_TIMEOUT;
 +static int processor_wait_timeout = DEFAULT_PROCESSOR_WAIT_TIMEOUT;
 +static int processor_wait_steps = DEFAULT_PROCESSOR_WAIT_STEPS;
++/* ProcessorPassTimeout: how long a multiplexer may wait to hand a request to
++   a processor that takes none (its socket is full), and how long that
++   processor's requests are then answered with 503 straight away. 0 = wait
++   forever, as before. */
++#ifndef DEFAULT_PROCESSOR_PASS_TIMEOUT
++#define DEFAULT_PROCESSOR_PASS_TIMEOUT 5
++#endif
++static int processor_pass_timeout = DEFAULT_PROCESSOR_PASS_TIMEOUT;
 +static int server_limit = DEFAULT_SERVER_LIMIT;
 +static int first_server_limit;
 +static int changed_limit_at_restart;
@@ -745,6 +757,10 @@
 +    /* we use these to reduce log clutter (report only on first failure) */
 +    short error_cgroup; /* When writing pid to cgroup fails */
 +    short error_pass;   /* When unable to pass request to the processor */
++
++    /* ProcessorPassTimeout: until this time the processor's requests get a
++       503 without waiting (0 = not blocked). Written by the multiplexers. */
++    apr_time_t pass_blocked_until;
 +
 +    /* statistics */
 +    unsigned long stats_requests;    /* requests handled */
@@ -1250,10 +1266,31 @@
 + * Connection structures and accounting...
 + */
 +
++/* SIGTERM, SIGHUP and SIGINT in a child. Only async-signal-safe calls here:
++ * the signal can land anywhere, inside malloc() or while a lock is held.
++ * Up to .7 this ran clean_child_exit(): apr_pool_destroy() and exit() from
++ * the handler. On 2026-11-16 (dcw-ds-1) a SIGTERM landed in malloc() inside
++ * mod_proxy's child_init, the pool destroy deadlocked on malloc's own lock,
++ * the child stayed alive holding proxy_mutex, and no new child could start
++ * until httpd was restarted. The same handler running in mod_watchdog's
++ * thread freed memory the main thread still used (the cores at every stop).
++ * _exit() skips the pool cleanups: the kernel closes the sockets and files,
++ * php-fpm sees the connection close, and the parent marks the slot dead
++ * when it reaps the child. */
 +static void just_die(int sig)
 +{
-+    _DBG("function called");
-+    clean_child_exit(0);
++    (void)sig;
++    _exit(0);
++}
++
++/* The signals a child dies on. They stay blocked from before fork() until
++ * the child is ready (see make_child() and child_main()). */
++static void startup_signals(sigset_t *set)
++{
++    sigemptyset(set);
++    sigaddset(set, SIGTERM);
++    sigaddset(set, SIGHUP);
++    sigaddset(set, SIGINT);
 +}
 +
 +/* volatile just in case */
@@ -1661,6 +1698,161 @@
 +}
 +
 +/*
++ * ProcessorPassTimeout. A multiplexer hands each request to its processor
++ * over the processor's socketpair. When no copy of the processor reads it
++ * (all of them hung: on 2026-11-16 every new child waited forever in
++ * mod_proxy's child_init for proxy_mutex), the socket fills up and a blocking
++ * sendmsg() never returns. One multiplexer after the other got stuck that
++ * way, and since the multiplexers are shared, every site on the server
++ * stopped answering. Now a multiplexer waits at most processor_pass_timeout
++ * seconds; then that processor's requests are answered with 503 at once for
++ * as long again, and the next one after that tries again.
++ */
++static int pass_blocked(child_info_t *processor)
++{
++    server_env_t *senv = processor->senv;
++
++    if (processor_pass_timeout <= 0 || !senv
++        || processor->type == CHILD_TYPE_MULTIPLEXER) {
++        return 0;
++    }
++    return senv->pass_blocked_until > apr_time_now();
++}
++
++/* The largest message the kernel queues on a unix stream socket as one
++   piece (unix_stream_sendmsg: half the send buffer, at most one skb's head
++   plus 32 KB of fragments). Below it a non-blocking sendmsg() sends all of
++   the message or none of it, so a timeout never leaves half a message in
++   the stream. */
++static size_t pass_atomic_limit(int fd)
++{
++    int sndbuf = 0;
++    socklen_t optlen = sizeof(sndbuf);
++    size_t limit = 32768;
++
++    if (getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, &optlen) == 0
++        && sndbuf / 2 - 64 > 0 && (size_t) (sndbuf / 2 - 64) < limit) {
++        limit = sndbuf / 2 - 64;
++    }
++    return limit;
++}
++
++/* sendmsg() the rest of a message after a partial send, blocking: the
++   stream must stay in step for the processor. Not expected below
++   pass_atomic_limit(), kept as a safety net. */
++static int send_rest_blocking(int fd, struct msghdr *msg, size_t sent)
++{
++    size_t i;
++
++    while (msg->msg_iovlen > 0) {
++        for (i = 0; i < (size_t) msg->msg_iovlen && sent > 0; i++) {
++            size_t n = msg->msg_iov[i].iov_len < sent
++                           ? msg->msg_iov[i].iov_len : sent;
++            msg->msg_iov[i].iov_base = (char *) msg->msg_iov[i].iov_base + n;
++            msg->msg_iov[i].iov_len -= n;
++            sent -= n;
++        }
++        while (msg->msg_iovlen > 0 && msg->msg_iov[0].iov_len == 0) {
++            msg->msg_iov++;
++            msg->msg_iovlen--;
++        }
++        if (msg->msg_iovlen == 0) {
++            break;
++        }
++        msg->msg_control = NULL;   /* the descriptor went with the first part */
++        msg->msg_controllen = 0;
++        {
++            ssize_t rv = sendmsg(fd, msg, 0);
++            if (rv == -1) {
++                if (errno == EINTR) continue;
++                return -1;
++            }
++            sent = (size_t) rv;
++        }
++    }
++    return 0;
++}
++
++static int send_to_processor(child_info_t *processor, struct msghdr *msg)
++{
++    server_env_t *senv = processor->senv;
++    int fd = senv->output;
++    size_t len = 0, i;
++    apr_time_t deadline;
++    ssize_t rv;
++
++    for (i = 0; i < (size_t) msg->msg_iovlen; i++) {
++        len += msg->msg_iov[i].iov_len;
++    }
++
++    if (processor_pass_timeout <= 0 || processor->type == CHILD_TYPE_MULTIPLEXER
++        || len > pass_atomic_limit(fd)) {
++        /* as before: a multiplexer target, the timeout off, or a message too
++           big to be sent in one piece */
++        return sendmsg(fd, msg, 0);
++    }
++
++    deadline = apr_time_now() + apr_time_from_sec(processor_pass_timeout);
++    for (;;) {
++        rv = sendmsg(fd, msg, MSG_DONTWAIT);
++        if (rv >= 0) {
++            if ((size_t) rv < len) {
++                ap_log_error(APLOG_MARK, APLOG_WARNING, 0, ap_server_conf,
++                             "Processor %s: request passed in parts "
++                             "(%ld of %lu bytes at once)", senv->name,
++                             (long) rv, (unsigned long) len);
++                if (send_rest_blocking(fd, msg, (size_t) rv) == -1) {
++                    return -1;
++                }
++            }
++            if (senv->pass_blocked_until != 0) {
++                senv->pass_blocked_until = 0;
++                ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, ap_server_conf,
++                             "Processor %s takes requests again",
++                             senv->name);
++            }
++            return (int) len;
++        }
++        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
++            return -1;
++        }
++        {
++            apr_time_t now = apr_time_now();
++            struct pollfd pfd;
++            int wait_ms;
++
++            if (now >= deadline) {
++                break;
++            }
++            /* another multiplexer gave up on this processor meanwhile */
++            if (senv->pass_blocked_until > now) {
++                errno = ETIMEDOUT;
++                return -1;
++            }
++            wait_ms = (int) apr_time_as_msec(deadline - now);
++            if (wait_ms > 200) wait_ms = 200;
++            if (wait_ms < 1) wait_ms = 1;
++            pfd.fd = fd;
++            pfd.events = POLLOUT;
++            pfd.revents = 0;
++            poll(&pfd, 1, wait_ms);
++        }
++    }
++
++    if (senv->pass_blocked_until <= apr_time_now()) {
++        ap_log_error(APLOG_MARK, APLOG_ERR, 0, ap_server_conf,
++                     "Processor %s took no request for %d s "
++                     "(ProcessorPassTimeout): answering its requests with "
++                     "503 for %d s", senv->name, processor_pass_timeout,
++                     processor_pass_timeout);
++    }
++    senv->pass_blocked_until = apr_time_now()
++                               + apr_time_from_sec(processor_pass_timeout);
++    errno = ETIMEDOUT;
++    return -1;
++}
++
++/*
 + * This function sends a raw socket over to a processor. It uses the same
 + * on-wire format as pass_request. The recipient can determine if he got
 + * a socket or a whole request by inspecting the header_length of the
@@ -1683,6 +1875,11 @@
 +    if (!processor) {
 +        _DBG("server %s in child %d has no child_info associated",
 +                "(unknown)", my_child_num);
++        return -1;
++    }
++
++    /* ProcessorPassTimeout: it took nothing lately, don't wait for it */
++    if (pass_blocked(processor)) {
 +        return -1;
 +    }
 +
@@ -1734,7 +1931,7 @@
 +    _DBG("header_len=%d headers=\"%s\"", header_len, h.headers);
 +    _DBG("body_len=%d body=\"%s\"", body_len, body);
 +
-+    if ((rv = sendmsg(processor->senv->output, &msg, 0)) == -1) {
++    if ((rv = send_to_processor(processor, &msg)) == -1) {
 +        apr_pool_destroy(pool);
 +        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, ap_server_conf,
 +                     "Writing message failed %d %d", rv, errno);
@@ -1952,6 +2149,11 @@
 +    _DBG("r->the_request=\"%s\" len=%d", r->the_request,
 +         strlen(r->the_request));
 +
++    /* ProcessorPassTimeout: it took nothing lately, don't wait for it */
++    if (pass_blocked(child)) {
++        return -1;
++    }
++
 +    /* Make sure there are free workers on the other end */
 +    if (child->type != CHILD_TYPE_MULTIPLEXER && wait_for_workers(child) == -1) {
 +        return -1;
@@ -2062,7 +2264,7 @@
 +    _DBG("header_len=%d headers=\"%s\"", header_len, h.headers);
 +    _DBG("body_len=%d body=\"%s\"", body_len, body);
 +
-+    if ((rv = sendmsg(child->senv->output, &msg, 0)) == -1) {
++    if ((rv = send_to_processor(child, &msg)) == -1) {
 +        apr_pool_destroy(r->pool);
 +        ap_log_error(APLOG_MARK, APLOG_DEBUG, 0, ap_server_conf,
 +                     "Writing message failed %d %d", rv, errno);
@@ -2643,6 +2845,21 @@
 +
 +    ap_create_sb_handle(&sbh, pchild, my_child_num, 0);
 +    (void) ap_update_child_status(sbh, SERVER_READY, (request_rec *) NULL);
++    /* The scoreboard sets last_used on SERVER_READY only with ExtendedStatus
++     * On. Without it, ExpireTimeout would see the slot's previous occupant's
++     * time and stop this child on the next pass. */
++    ap_scoreboard_image->servers[my_child_num][0].last_used = apr_time_now();
++
++    /* Startup is over: let SIGTERM, SIGHUP and SIGINT in, in this thread.
++     * They were blocked since make_child(), so none could land inside a
++     * child_init hook with a lock held. Threads that child_init started
++     * (mod_watchdog's) inherited the blocked mask and keep it, so the
++     * signals come to this thread only. */
++    {
++        sigset_t set;
++        startup_signals(&set);
++        pthread_sigmask(SIG_UNBLOCK, &set, NULL);
++    }
 +
 +    /* Set up the pollfd array */
 +    listensocks = apr_pcalloc(pchild, sizeof(*listensocks) * (num_listensocks));
@@ -2944,6 +3161,7 @@
 +    memcpy(&SENV[NUM_SENV], senv, sizeof(server_env_t));
 +
 +    SENV[NUM_SENV].availability = 100;
++    SENV[NUM_SENV].pass_blocked_until = 0;
 +
 +    socketpair(PF_UNIX, SOCK_STREAM, 0, socks);
 +    SENV[NUM_SENV].input = socks[0];
@@ -3073,6 +3291,7 @@
 +static int make_child(server_rec *s, int slot)
 +{
 +    int pid;
++    sigset_t startup_set, parent_mask;
 +
 +    _DBG("function entered slot=%d", slot);
 +    dump_server_env_image();
@@ -3107,6 +3326,13 @@
 +
 +    CHILD_INFO_TABLE[slot].status = CHILD_STATUS_READY;
 +
++    /* Block the signals a child dies on across fork(): the child keeps them
++     * blocked until it is ready (child_main() lets them in), the parent
++     * restores its mask right after fork(). A signal sent meanwhile stays
++     * pending and is taken then. */
++    startup_signals(&startup_set);
++    sigprocmask(SIG_BLOCK, &startup_set, &parent_mask);
++
 +#ifdef _OSD_POSIX
 +    /* BS2000 requires a "special" version of fork() before a setuid() call */
 +    if ((pid = os_fork(ap_unixd_config.user_name)) == -1) {
@@ -3123,6 +3349,7 @@
 +         */
 +        (void) ap_update_child_status_from_indexes(slot, 0, SERVER_DEAD,
 +                                                   (request_rec *) NULL);
++        sigprocmask(SIG_SETMASK, &parent_mask, NULL);
 +
 +        /* In case system resources are maxxed out, we don't want
 +         Apache running away with the CPU trying to fork over and
@@ -3158,6 +3385,8 @@
 +        clean_child_exit(0);
 +    }
 +
++    sigprocmask(SIG_SETMASK, &parent_mask, NULL);
++
 +    ap_scoreboard_image->parent[slot].pid = pid;
 +    CHILD_INFO_TABLE[slot].pid = pid;
 +    CHILD_INFO_TABLE[slot].senv->active_processors++;
@@ -3183,6 +3412,28 @@
 +                                worker_score *child_sb, apr_time_t now)
 +{
 +    time_t idle_time = apr_time_sec(now - child_sb->last_used);
++
++    /* Never stop a child that is still starting (fork() to SERVER_READY):
++     * it can't take the signal yet anyway (make_child() blocks it), and up
++     * to .7 the signal could land inside a child_init hook with a lock held.
++     * Its last_used is still the slot's previous occupant's, so the
++     * ExpireTimeout rules below took a child started in a slot unused for
++     * longer than ExpireTimeout for an expired one. Logged when that rule
++     * would have stopped it: the trigger of 2026-11-16, if that's what it was. */
++    if (child_sb->status == SERVER_STARTING) {
++        if ((child->type == CHILD_TYPE_PROCESSOR || child->type == CHILD_TYPE_WORKER)
++            && expire_timeout > 0 && idle_time > expire_timeout
++            && !(child->senv->min_processors > 0
++                 && child->senv->total_processes <= child->senv->min_processors)) {
++            ap_log_error(APLOG_MARK, APLOG_WARNING, 0, ap_server_conf,
++                         "peruser: not stopping child #%d (pid %d, processor %s): "
++                         "it is still starting; up to .7 ExpireTimeout (%d s) "
++                         "stopped it here, its slot was unused for %ld s",
++                         childnum, (int)ap_scoreboard_image->parent[childnum].pid,
++                         child->senv->name, expire_timeout, (long)idle_time);
++        }
++        return 0;
++    }
 +
 +    /* All active processors must be killed after ExpireTimeout, regardless
 +       MinProcessors, or infinite loop processors will never end  */       
@@ -3918,6 +4169,7 @@
 +    multiplexer_idle_timeout = DEFAULT_MULTIPLEXER_IDLE_TIMEOUT;
 +    processor_wait_timeout = DEFAULT_PROCESSOR_WAIT_TIMEOUT;
 +    processor_wait_steps = DEFAULT_PROCESSOR_WAIT_STEPS;
++    processor_pass_timeout = DEFAULT_PROCESSOR_PASS_TIMEOUT;
 +
 +    apr_cpystrn(ap_coredump_dir, ap_server_root, sizeof(ap_coredump_dir));
 +
@@ -4062,6 +4314,7 @@
 +    senv.stats_connections = 0;
 +    senv.stats_requests = 0;
 +    senv.stats_dropped = 0;
++    senv.pass_blocked_until = 0;
 +    senv.total_processors = 0;
 +    senv.idle_processors = 0;
 +    senv.active_processors = 0;
@@ -4457,6 +4710,7 @@
 +    senv->stats_connections = 0;
 +    senv->stats_requests = 0;
 +    senv->stats_dropped = 0;
++    senv->pass_blocked_until = 0;
 +    senv->total_processors = 0;
 +    senv->idle_processors = 0;
 +    senv->active_processors = 0;
@@ -5164,6 +5418,23 @@
 +    return NULL;
 +}
 +
++static const char *set_processor_pass_timeout(cmd_parms *cmd, void *dummy,
++                                              const char *arg)
++{
++    const char *err = ap_check_cmd_context(cmd, GLOBAL_ONLY);
++
++    if (err != NULL) {
++        return err;
++    }
++
++    processor_pass_timeout = atoi(arg);
++    if (processor_pass_timeout < 0) {
++        return "ProcessorPassTimeout must be 0 (off) or a number of seconds";
++    }
++
++    return NULL;
++}
++
 +static const command_rec peruser_cmds[] = {
 +LISTEN_COMMANDS,
 +AP_INIT_TAKE1("MinSpareProcessors", set_min_free_processors, NULL, RSRC_CONF,
@@ -5201,6 +5472,10 @@
 +AP_INIT_TAKE12("ProcessorWaitTimeout", set_processor_wait_timeout, NULL,
 +               RSRC_CONF, "Maximum time a multiplexer waits for the processor"
 +               " if it is busy"),
++AP_INIT_TAKE1("ProcessorPassTimeout", set_processor_pass_timeout, NULL,
++              RSRC_CONF, "Seconds a multiplexer waits to hand a request to a"
++              " processor that takes none, then answers its requests with"
++              " 503 for as long; 0 waits forever"),
 +AP_INIT_TAKE23("Multiplexer", cf_Multiplexer, NULL, RSRC_CONF,
 +              "Specify an Multiplexer Child configuration."),
 +AP_INIT_RAW_ARGS("<Processor", cf_Processor, NULL, RSRC_CONF,

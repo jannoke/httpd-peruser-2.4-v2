@@ -13,7 +13,7 @@
 Summary:              Apache HTTP Server
 Name:                 httpd
 Version:              2.4.62
-Release:              1%{?dist}.6.peruser.dc
+Release:              1%{?dist}.8.peruser.dc
 URL:                  https://httpd.apache.org/
 Source0:              https://www.apache.org/dist/httpd/httpd-%{version}.tar.bz2
 Source1:              https://www.apache.org/dist/httpd/httpd-%{version}.tar.bz2.asc
@@ -835,6 +835,24 @@ exit $rv
 %{_rpmconfigdir}/macros.d/macros.httpd
 
 %changelog
+* Mon Nov 16 2026 Janno Sannik <janno@kood.ee> - 2.4.62-1.8.peruser.dc
+- peruser: a SIGTERM during a child's startup can no longer stop the server.
+  just_die() ran clean_child_exit() (apr_pool_destroy(), exit()) inside the
+  signal handler; on 2026-11-16 (dcw-ds-1) a SIGTERM landed in malloc() inside
+  mod_proxy's child_init, the child deadlocked on malloc's lock while holding
+  proxy_mutex, and no new child could start. Now just_die() only calls _exit();
+  SIGTERM, SIGHUP and SIGINT are blocked from before fork() until the child is
+  ready (threads child_init starts keep them blocked); determine_child_fate()
+  never stops a starting child and logs when ExpireTimeout would have; a ready
+  child sets its last_used itself (ExtendedStatus Off).
+
+* Mon Nov 16 2026 Janno Sannik <janno@kood.ee> - 2.4.62-1.7.peruser.dc
+- peruser: ProcessorPassTimeout (default 5 s, 0 = off). A multiplexer waits
+  at most that long to hand a request to a processor that takes none; then
+  the processor's requests get a 503 at once for as long again. Before, its
+  sendmsg() blocked forever on the full socket, and once every multiplexer
+  was stuck that way, no site on the server answered (dcw-ds-1, 2026-11-16).
+
 * Fri Nov 06 2026 Janno Sannik <janno@kood.ee> - 2.4.62-1.6.peruser.dc
 - peruser: the "too many spare workers" rule (MaxSpareProcessors) stops only
   idle workers. It killed busy ones too, mid-request: the client got a 502,
