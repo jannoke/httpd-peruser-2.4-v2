@@ -29,6 +29,7 @@ set `EL_VERSION`.
 │   ├── build-rpm-dev.sh              # In-container build script (dev loop)
 │   ├── dev-build-loop.sh             # Interactive dev build loop (see below)
 │   └── agent-build-loop.sh           # Non-interactive build script (agent use)
+├── devenv/                           # Build from a patched source tree, no rpmbuild
 └── README.md                         # This file
 ```
 
@@ -46,6 +47,61 @@ EL_VERSION=10 ./build-rpm.sh  # el10
 
 RPMs are written to `src/output/el9/RPMS/` or `src/output/el10/RPMS/` (matching
 `EL_VERSION`, the source RPM to `SRPMS/` beside it) when the build succeeds.
+
+---
+
+## Development environment — build without rpmbuild
+
+`devenv/devenv.sh` gives you a patched httpd source tree you can edit and
+rebuild incrementally, without going through `rpmbuild`. Everything runs in
+the same Rocky Linux container CI uses (`EL_VERSION=9|10`). The repo is
+mounted at the same absolute path inside the container, so compiler errors
+and gdb paths are valid on the host too.
+
+```bash
+./devenv/devenv.sh prep       # unpack the tarball, apply every patch in the spec's %prep order
+./devenv/devenv.sh build      # autoconf + configure (when needed) + make -j
+./devenv/devenv.sh install    # make install into devenv/work/el9/install
+./devenv/devenv.sh run        # start it (peruser, users alpha/bravo) on localhost:18080
+curl -H 'Host: alpha.test' localhost:18080
+```
+
+The patch order and the `./configure` options are read from `src/httpd.spec`
+each time, so the devenv stays in step with the spec. Patches are applied
+with `--fuzz=0`, the same as rpmbuild. Only the filesystem layout differs:
+the devenv installs everything under one prefix instead of `/etc/httpd`,
+`/usr/lib64/httpd`, and so on.
+
+Layout under `devenv/work/el9/` (gitignored):
+
+| Directory  | What it is |
+|------------|------------|
+| `source/`  | **Edit here.** A git repo: `upstream` commit, then one commit per patch (`Patch300: peruser-2.4-httpd24-fix.patch -p1`, …), then the spec's `sed` tweaks |
+| `build/`   | rsync'd copy where autoconf/configure/make run, so generated files never end up in `source/` |
+| `install/` | `make install` prefix |
+
+Write your edits back into the patch files:
+
+```bash
+vi devenv/work/el9/source/server/mpm/peruser/peruser.c
+./devenv/devenv.sh build                 # incremental, only changed files recompile
+./devenv/devenv.sh save peruser          # fold the edits into the Patch300 commit and
+                                         # rewrite src/peruser-2.4-httpd24-fix.patch
+./devenv/devenv.sh series                # patch -> commit list, uncommitted changes
+```
+
+`save` makes a fixup commit and autosquash-rebases it into that patch's
+commit. Later patches are replayed on top, so any conflict with them shows
+up right away. The rewritten patch file is plain `git diff` output, so the
+first save also adds `diff --git`/`index` lines and function names to the
+hunk headers. `patch`/rpmbuild apply it the same way.
+
+Other commands: `shell` (or `shell --root`), `configure`, `export <patch>`,
+`clean` (removes build + install), `prep --force` / `reset --force` (start
+over; **this discards edits in `source/`**). `DEVENV_CFLAGS=rpm` builds with
+the distro `%optflags` instead of the default `-O0 -g3`. `DEVENV_PORT`
+changes the host port, and `DEVENV_NATIVE=1` runs on the host (needs the
+build deps and `rpmspec`).
 
 ---
 
