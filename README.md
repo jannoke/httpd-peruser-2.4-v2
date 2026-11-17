@@ -32,9 +32,111 @@ set `EL_VERSION`.
 │   ├── local-smoke-test.sh           # Install the RPMs, start/request/stop cycles
 │   ├── spare-kill-test.sh            # Regression: MaxSpareProcessors never stops a busy copy (.6)
 │   ├── pass-timeout-test.sh          # Regression: a processor that takes nothing can't stop the server (.7)
-│   └── startup-hang-test.sh          # Regression: a SIGTERM during a child's startup can't stop the server (.8)
+│   ├── startup-hang-test.sh          # Regression: a SIGTERM during a child's startup can't stop the server (.8)
+│   └── review-hardening-test.sh      # Regression: the review fixes, nine cases (.9); uses review-hardening-probe.py
 └── README.md                         # This file
 ```
+
+## Review hardening (`.9.peruser.dc`)
+
+Fixes from the security and stability review of 2026-11-16 (two reviews of the MPM, checked against
+the source and merged). `review-hardening-test.sh` has a case for each group. On `.8` eight of its
+nine cases fail; `extstatus` passes there because `.8` already fixed the behaviour.
+
+**The hand-off between multiplexer and worker**
+
+- **Body read from outside the buffer.** The message carries the request head and what was already
+  read of the body. Only the head's length was limited (20000 bytes), and the worker rebuilt the
+  body from a 20000-byte buffer. A POST with a head over ~18 KB got part of its body from the
+  worker's stack instead, with a 200. Now both sides check the same bound
+  (`PERUSER_MAX_PASS_DATA`, 30000 bytes for head and body together, checked at compile time against
+  one socket buffer). The multiplexer answers 413 to a head over it, and the worker drops a message
+  that doesn't add up and closes the connection (case `handoff`).
+- **Request pool freed before the 503.** `pass_request()` destroyed the request's pool on a failed
+  send and returned an error, and httpd then wrote the 503 from that freed request, in a
+  multiplexer that every site shares. `.7`'s ProcessorPassTimeout made that path common. It no
+  longer destroys the pool.
+- **Smaller ones:** `pass_socket()` checks its sends, the pipe-of-death read is checked, and the
+  address in the message is validated.
+
+**One tenant can't stop the server**
+
+A child that exits with `APEXIT_CHILDFATAL` (setuid, setgid, chroot or cgroup failed) made the
+parent return at once: every site down, the children left behind. Now it depends on whose it was:
+
+- **A tenant's processor or worker:** an error line names the processor, no replacement is forked,
+  and its requests get a 503 for 10 s (`PERUSER_START_BLOCK_SECS`). Then the next request tries
+  again. Connections already queued for it are closed by the parent when no child is left to read
+  them. httpd's own `AH00050 ... Apache is exiting!` line still appears just before ours, and it's
+  wrong in this case (case `tenant`).
+- **A multiplexer, or a process the parent has no record of:** the server still stops, but the
+  normal way (children signalled and reaped, pid file removed), with an alert line and a failing
+  exit status.
+
+**Stop and restart**
+
+- **SIGWINCH stops the server.** It was ignored, so `apachectl graceful-stop` and the unit's
+  `KillSignal=SIGWINCH` did nothing until systemd's timeout. It's a plain stop, not a graceful one:
+  requests in progress are cut, as with SIGTERM.
+- **A requested stop exits 0.** It returned an error, so every stop logged `AH02818: MPM run
+  failed` and exited 1 (case `stop`).
+- **State survives the module's reload.** httpd unloads and reloads the MPM between its two config
+  passes and on every restart, which reset all of peruser's statics. They're kept with
+  `ap_retained_data` now:
+  - the generation number is carried on, so children of the old generation are recognised;
+  - the two tables' shared memory is released at each load, where two segments leaked per restart;
+  - httpd detaches when started without `-DFOREGROUND` (it never did; case `daemon`);
+  - ServerLimit is fixed at the first start. A reload with another value warns and keeps the old
+    one, where raising it crashed the parent two reloads later. **Changing ServerLimit needs a full
+    restart.**
+- **Old children are tracked.** At a graceful restart the children still finishing a request go on
+  the core's extra-process list. Their exit is no longer "long lost child came home", and a stop
+  ends them, where they were left running. Child start and exit are reported to the core
+  (`mpm_child_status`), and `AP_MPMQ_GENERATION` is answered (case `reload`).
+- **The parent's own socket pairs** are closed from its own list, not through the shared table
+  that children can write.
+
+**Configuration**
+
+- **ServerLimit and the scoreboard.** The scoreboard was sized by MaxClients' default (256) and the
+  tables by ServerLimit, so a ServerLimit of 10 without MaxClients crashed the parent on stop and
+  reload. Both use ServerLimit now, MaxClients defaults to it, and a MaxClients above it is cut
+  with a warning (case `limit`).
+- **Table sizes.** The tables' control structs were allocated by the size of a pointer;
+  ServerLimit 406 and 918 crashed `httpd -t`.
+- **A ServerLimit below what's configured** is a config error with a message that says to put it
+  before the Processor directives, not an overrun.
+- **`MaxSpareProcessors` in a vhost before `ServerEnvironment`** crashed `httpd -t` (case
+  `configtest`).
+- **ExtendedStatus Off** is overridden with a warning: IdleTimeout and ExpireTimeout read the
+  scoreboard's `last_used` (case `extstatus`).
+- **Warnings** when MaxSpareProcessors is closer than 3 to MinSpareProcessors (the workers are
+  started and stopped in turns), and when ProcessorWaitTimeout's steps are over 100 (cut to 100: the
+  step size was 0 and the wait never ended).
+- **Processors with different Chroot settings** are no longer merged (and comparing a set one with
+  an unset one no longer crashes), and a failed `socketpair()` at config time is an error.
+
+**Smaller**
+
+- **MaxRequestsPerChild counts connections.** It counted wake-ups, and every passed connection
+  wakes all of a processor's idle workers, so they were all recycled together after N requests to
+  the processor (case `maxreq`).
+- A request to start a child that arrives while the parent is starting others isn't lost until the
+  next maintenance pass.
+- `qsort()`'s compare function returns a real three-way result; four unused functions are gone (two
+  of them called `free()` on pool memory).
+
+**Not changed, on purpose**
+
+- **The shared tables stay writable by every child** (child table, environment table, scoreboard).
+  A worker whose memory is taken over can still mislead the parent. That needs a redesign: the
+  parent's own copy of what it acts on.
+- **A graceful restart still isn't graceful for requests being passed:** the tables are new for
+  each generation, and for a moment requests are refused. Old children also share scoreboard slots
+  with new ones.
+- **Keep-alive across vhosts,** ExpireTimeout's meaning, the lock-free counters, and the 1 s sleep
+  in a multiplexer after it asks for a new worker.
+- **MaxClients** is still not a real cap on processes; ServerLimit is.
 
 ## Signals in a starting child (`.8.peruser.dc`)
 
